@@ -416,7 +416,6 @@ class NPUModelRunner(GPUModelRunner):
             and not self.use_cp
             and not self.use_aclgraph
             and not self.parallel_config.enable_dbo
-            and len(self.kv_cache_config.kv_cache_groups) == 1
         )
         self.rkv_seq_lens = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int32)
         self.rkv_effective_kv_lens: dict[str, int] = {}
@@ -457,6 +456,19 @@ class NPUModelRunner(GPUModelRunner):
 
     def _rkv_can_use_for_state(self, attn_state: AscendAttentionState | None) -> bool:
         return self.rkv_enabled and attn_state == AscendAttentionState.DecodeOnly
+
+    def _update_rkv_enabled_for_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        if not self.rkv_enabled:
+            return
+
+        num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+        if num_kv_cache_groups != 1:
+            logger.warning(
+                "R-KV is disabled because it only supports a single KV cache "
+                "group, but got %d groups.",
+                num_kv_cache_groups,
+            )
+            self.rkv_enabled = False
 
     def _get_rkv_effective_kv_lens(self, num_reqs: int) -> np.ndarray:
         effective_lens = np.empty(num_reqs, dtype=np.int32)
@@ -2721,6 +2733,7 @@ class NPUModelRunner(GPUModelRunner):
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+        self._update_rkv_enabled_for_kv_cache(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
