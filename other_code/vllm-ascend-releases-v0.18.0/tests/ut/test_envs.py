@@ -12,8 +12,13 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+import importlib.util
 import inspect
 import os
+import sys
+import types
+from pathlib import Path
+from unittest.mock import patch
 
 import vllm_ascend.envs as envs_ascend
 from tests.ut.base import TestBase
@@ -60,3 +65,30 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_env_vars_registered_to_vllm(self):
+        patch_envs_path = (Path(envs_ascend.__file__).parent /
+                           "patch/platform/patch_envs.py")
+        fake_vllm = types.ModuleType("vllm")
+        fake_vllm_envs = types.ModuleType("vllm.envs")
+        fake_vllm_envs.env_variables = {
+            "VLLM_ASCEND_RKV_BUDGET": lambda: -1,
+        }
+        fake_vllm.envs = fake_vllm_envs
+
+        spec = importlib.util.spec_from_file_location("test_patch_envs",
+                                                      patch_envs_path)
+        assert spec is not None
+        assert spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {
+                "vllm": fake_vllm,
+                "vllm.envs": fake_vllm_envs,
+        }):
+            spec.loader.exec_module(module)
+
+        for var_name in self.env_vars:
+            with self.subTest(var=var_name):
+                self.assertIn(var_name, fake_vllm_envs.env_variables)
+        self.assertEqual(
+            fake_vllm_envs.env_variables["VLLM_ASCEND_RKV_BUDGET"](), -1)

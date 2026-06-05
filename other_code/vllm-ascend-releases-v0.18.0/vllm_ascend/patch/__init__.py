@@ -258,6 +258,24 @@
 #       Remove this patch once the upstream forced-tool-choice fix is included
 #       in the runtime vLLM version used by vllm-ascend.
 #
+# ** 12. File: platform/patch_envs.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.envs.env_variables`
+#    Why:
+#       vLLM warns for unknown `VLLM_*` environment variables using its core
+#       environment registry. vllm-ascend reads extension variables from
+#       `vllm_ascend.envs`, but newly added Ascend-specific options should also
+#       be visible to the core vLLM registry.
+#    How：
+#       Register vllm-ascend environment variable handlers into
+#       `vllm.envs.env_variables` with `setdefault`, so upstream definitions
+#       are preserved when vLLM already knows a variable.
+#    Related PR (if no, explain why):
+#       No upstream PR. This is an extension registry bridge for vllm-ascend.
+#    Future Plan:
+#       Remove this patch if vLLM provides a first-class plugin environment
+#       variable registration hook.
+#
 # * Worker Patch:
 # ===============
 #
