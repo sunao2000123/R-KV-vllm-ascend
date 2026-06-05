@@ -419,7 +419,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         self.rkv_seq_lens = self._make_buffer(self.max_num_reqs + 2, dtype=torch.int32)
         self.rkv_effective_kv_lens: dict[str, int] = {}
+        self.rkv_pending_reset_req_ids: set[str] = set()
         self.rkv_current_req_ids: list[str] = []
+        self.rkv_current_reset_req_ids: list[str] = []
         self.rkv_current_enabled = False
         self.rkv_effective_kv_lens_before = np.empty(0, dtype=np.int32)
         # here we use int32
@@ -480,6 +482,20 @@ class NPUModelRunner(GPUModelRunner):
             effective_lens[req_idx] = effective_len
         return effective_lens
 
+    def _reset_rkv_state_from_scheduler_output(self, scheduler_output: "SchedulerOutput") -> None:
+        if not self.rkv_enabled:
+            return
+
+        reset_req_ids: set[str] = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
+        reset_req_ids.update(getattr(scheduler_output, "preempted_req_ids", ()) or ())
+        reset_req_ids.update(req.req_id for req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ())
+        if not reset_req_ids:
+            return
+
+        for req_id in reset_req_ids:
+            self.rkv_effective_kv_lens.pop(req_id, None)
+        self.rkv_pending_reset_req_ids.update(reset_req_ids)
+
     def _iter_rkv_attn_metadata(self, attn_metadata: PerLayerAttnMetadata):
         if isinstance(attn_metadata, list):
             for ubatch_metadata in attn_metadata:
@@ -513,6 +529,14 @@ class NPUModelRunner(GPUModelRunner):
         for req_id in list(self.rkv_effective_kv_lens):
             if req_id not in active_req_ids and req_id not in self.requests:
                 self.rkv_effective_kv_lens.pop(req_id, None)
+
+        for req_id in list(self.rkv_pending_reset_req_ids):
+            if req_id not in active_req_ids and req_id not in self.requests:
+                self.rkv_pending_reset_req_ids.discard(req_id)
+
+        for req_id in self.rkv_current_reset_req_ids:
+            self.rkv_pending_reset_req_ids.discard(req_id)
+        self.rkv_current_reset_req_ids = []
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -656,6 +680,7 @@ class NPUModelRunner(GPUModelRunner):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        self._reset_rkv_state_from_scheduler_output(scheduler_output)
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -683,9 +708,13 @@ class NPUModelRunner(GPUModelRunner):
         self.rkv_current_enabled = self._rkv_can_use_for_state(attn_state)
         if self.rkv_current_enabled:
             self.rkv_current_req_ids = list(self.input_batch.req_ids[:num_reqs])
+            self.rkv_current_reset_req_ids = [
+                req_id for req_id in self.rkv_current_req_ids if req_id in self.rkv_pending_reset_req_ids
+            ]
             self.rkv_effective_kv_lens_before = self._get_rkv_effective_kv_lens(num_reqs)
         else:
             self.rkv_current_req_ids = []
+            self.rkv_current_reset_req_ids = []
             self.rkv_effective_kv_lens_before = np.empty(0, dtype=np.int32)
 
         # Get positions.
@@ -2250,6 +2279,7 @@ class NPUModelRunner(GPUModelRunner):
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
             rkv_req_ids=list(self.input_batch.req_ids[:num_reqs]) if self.rkv_current_enabled else None,
+            rkv_reset_req_ids=self.rkv_current_reset_req_ids if self.rkv_current_enabled else None,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:

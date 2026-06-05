@@ -166,6 +166,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # per-request query windows across decode steps.
     rkv_req_ids: list[str] | None = None
 
+    # Request ids whose R-KV per-request state must be discarded before the
+    # current decode step. This covers finished, preempted and reused ids.
+    rkv_reset_req_ids: list[str] | None = None
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -193,6 +197,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
             rkv_req_ids=self.rkv_req_ids[:num_actual_reqs] if self.rkv_req_ids is not None else None,
+            rkv_reset_req_ids=self.rkv_reset_req_ids,
         )
 
 

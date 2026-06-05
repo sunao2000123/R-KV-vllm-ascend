@@ -84,6 +84,33 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
 
+    def test_rkv_reset_tracks_reused_finished_and_preempted_requests(self):
+        runner = self._build_runner()
+        runner.rkv_enabled = True
+        runner.rkv_effective_kv_lens = {
+            "reused": 128,
+            "finished": 256,
+            "preempted": 384,
+            "active": 512,
+        }
+        runner.rkv_pending_reset_req_ids = set()
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id="reused")],
+            finished_req_ids={"finished"},
+            preempted_req_ids={"preempted"},
+        )
+
+        runner._reset_rkv_state_from_scheduler_output(scheduler_output)
+
+        self.assertNotIn("reused", runner.rkv_effective_kv_lens)
+        self.assertNotIn("finished", runner.rkv_effective_kv_lens)
+        self.assertNotIn("preempted", runner.rkv_effective_kv_lens)
+        self.assertEqual(runner.rkv_effective_kv_lens["active"], 512)
+        self.assertEqual(
+            runner.rkv_pending_reset_req_ids,
+            {"reused", "finished", "preempted"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

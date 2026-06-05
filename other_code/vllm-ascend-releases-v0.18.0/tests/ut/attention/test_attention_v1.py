@@ -212,6 +212,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         metadata.attn_state = attn_state
         metadata.block_tables = torch.zeros(1, 32, dtype=torch.long)
         metadata.rkv_req_ids = ["req"]
+        metadata.rkv_reset_req_ids = []
         metadata.seq_lens_list = [seq_len]
         metadata.actual_seq_lengths_q = [1]
         metadata.rkv_compressed_lens = None
@@ -233,6 +234,23 @@ class TestAscendAttentionBackendImpl(TestBase):
         metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly)
         self.impl._update_rkv_query_cache(query, metadata)
         self.assertIn("req", self.impl.rkv_query_cache)
+
+    @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
+    @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
+    def test_rkv_query_cache_resets_reused_req_id(self, mock_extra_ctx,
+                                                  mock_enable_cp):
+        self._enable_rkv_for_test()
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
+        self.impl.rkv_query_cache["req"] = torch.randn(8, 8, 64)
+        query = torch.randn(1, 8, 64)
+        metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly)
+        metadata.rkv_reset_req_ids = ["req"]
+
+        self.impl._update_rkv_query_cache(query, metadata)
+
+        self.assertEqual(self.impl.rkv_query_cache["req"].shape[0], 1)
+        self.assertTrue(torch.equal(self.impl.rkv_query_cache["req"], query))
 
     @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
     @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')

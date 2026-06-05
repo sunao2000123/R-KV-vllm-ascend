@@ -786,13 +786,25 @@ class NPUPlatform(Platform):
                 model_config.disable_cascade_attn = False
 
         # ==================== 2. Cache Config ====================
-        if vllm_config.cache_config:
+        cache_config = vllm_config.cache_config
+        if cache_config:
             # Check and reset cpu_kvcache_space_bytes
-            if getattr(vllm_config.cache_config, "cpu_kvcache_space_bytes", False):
+            if getattr(cache_config, "cpu_kvcache_space_bytes", False):
                 logger.warning(
                     "Parameter 'cpu_kvcache_space_bytes' is tied to cpu backend. Resetting to None for Ascend."
                 )
-                vllm_config.cache_config.cpu_kvcache_space_bytes = None
+                cache_config.cpu_kvcache_space_bytes = None
+
+            if (
+                envs_ascend.VLLM_ASCEND_RKV_ENABLE
+                and envs_ascend.VLLM_ASCEND_RKV_BUDGET > 0
+                and getattr(cache_config, "enable_prefix_caching", None) is not False
+            ):
+                logger.warning(
+                    "R-KV is incompatible with prefix caching because it rewrites KV cache blocks in-place. "
+                    "Disabling prefix caching for this run."
+                )
+                cache_config.enable_prefix_caching = False
 
         # ==================== 3. MultiModal Config ====================
         multimodal_config = getattr(model_config, "multimodal_config", None) if model_config else None

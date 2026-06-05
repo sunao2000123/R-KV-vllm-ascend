@@ -166,6 +166,19 @@ class TestNPUPlatform(TestBase):
 
         self.assertIsNone(vllm_config.compilation_config.max_cudagraph_capture_size)
 
+    @patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_RKV_BUDGET", 1024)
+    @patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_RKV_ENABLE", True)
+    def test_fix_incompatible_config_disables_prefix_cache_for_rkv(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.cache_config.enable_prefix_caching = True
+        vllm_config.cache_config.cpu_kvcache_space_bytes = None
+
+        with self.assertLogs(logger="vllm", level="WARNING") as cm:
+            self.platform._fix_incompatible_config(vllm_config)
+
+        self.assertFalse(vllm_config.cache_config.enable_prefix_caching)
+        self.assertTrue("R-KV is incompatible with prefix caching" in cm.output[0])
+
     @patch("vllm_ascend.platform.refresh_block_size")
     @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
     @patch("vllm_ascend.platform.enable_sp", return_value=False)

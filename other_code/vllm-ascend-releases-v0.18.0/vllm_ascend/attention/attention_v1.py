@@ -206,6 +206,7 @@ class AscendMetadata:
 
     # R-KV per-request state shared with the runner.
     rkv_req_ids: list[str] | None = None
+    rkv_reset_req_ids: list[str] | None = None
     rkv_compressed_lens: list[int] | None = None
 
 
@@ -328,6 +329,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
             rkv_req_ids=common_attn_metadata.rkv_req_ids,
+            rkv_reset_req_ids=common_attn_metadata.rkv_reset_req_ids,
         )
         return attn_metadata
 
@@ -975,6 +977,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
     def _update_rkv_query_cache(self, query: torch.Tensor, attn_metadata: AscendMetadata) -> None:
         if not self._rkv_runtime_enabled(query, attn_metadata):
             return
+        for req_id in attn_metadata.rkv_reset_req_ids or []:
+            self.rkv_query_cache.pop(req_id, None)
+
         req_ids = attn_metadata.rkv_req_ids or []
         active_req_ids = set(req_ids)
         for cached_req_id in list(self.rkv_query_cache):
