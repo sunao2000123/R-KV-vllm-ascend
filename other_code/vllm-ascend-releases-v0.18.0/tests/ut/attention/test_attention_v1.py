@@ -196,6 +196,59 @@ class TestAscendAttentionBackendImpl(TestBase):
             attn_type=self.attention_type.DECODER,
             kv_sharing_target_layer_name=None)
 
+    def _enable_rkv_for_test(self):
+        self.impl.rkv_enabled = True
+        self.impl.rkv_compressor = MagicMock()
+        self.impl.rkv_compressor.budget = 1024
+        self.impl.rkv_compressor.window_size = 8
+        self.impl.rkv_query_cache = {}
+        self.impl.vllm_config.speculative_config = None
+        self.impl.vllm_config.model_config.use_mla = False
+        self.impl.key_cache = torch.zeros(2, 128, 8, 64)
+        self.impl.value_cache = torch.zeros(2, 128, 8, 64)
+
+    def _rkv_metadata(self, attn_state, seq_len=1):
+        metadata = MagicMock()
+        metadata.attn_state = attn_state
+        metadata.block_tables = torch.zeros(1, 32, dtype=torch.long)
+        metadata.rkv_req_ids = ["req"]
+        metadata.seq_lens_list = [seq_len]
+        metadata.actual_seq_lengths_q = [1]
+        metadata.rkv_compressed_lens = None
+        return metadata
+
+    @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
+    @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
+    def test_rkv_query_cache_updates_only_in_decode(self, mock_extra_ctx,
+                                                    mock_enable_cp):
+        self._enable_rkv_for_test()
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
+        query = torch.randn(1, 8, 64)
+
+        metadata = self._rkv_metadata(AscendAttentionState.ChunkedPrefill)
+        self.impl._update_rkv_query_cache(query, metadata)
+        self.assertNotIn("req", self.impl.rkv_query_cache)
+
+        metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly)
+        self.impl._update_rkv_query_cache(query, metadata)
+        self.assertIn("req", self.impl.rkv_query_cache)
+
+    @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
+    @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
+    def test_rkv_compression_waits_for_query_window(self, mock_extra_ctx,
+                                                    mock_enable_cp):
+        self._enable_rkv_for_test()
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
+        self.impl.rkv_query_cache["req"] = torch.randn(7, 8, 64)
+        metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly, seq_len=4096)
+
+        with patch.object(self.impl, '_gather_rkv_kv') as mock_gather:
+            self.impl._maybe_compress_rkv(torch.randn(1, 8, 64), metadata)
+
+        mock_gather.assert_not_called()
+
     def test_forward_no_attn_metadata(self):
         """Test forward pass when attn_metadata is None"""
         query = torch.randn(10, 8 * 64)

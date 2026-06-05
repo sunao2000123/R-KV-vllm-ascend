@@ -973,7 +973,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return len(attn_metadata.rkv_req_ids) > 0 and len(attn_metadata.seq_lens_list) > 0
 
     def _update_rkv_query_cache(self, query: torch.Tensor, attn_metadata: AscendMetadata) -> None:
-        if not self.rkv_enabled or self.rkv_compressor is None or attn_metadata.rkv_req_ids is None:
+        if not self._rkv_runtime_enabled(query, attn_metadata):
             return
         req_ids = attn_metadata.rkv_req_ids or []
         active_req_ids = set(req_ids)
@@ -1062,7 +1062,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
             req_id = req_ids[req_idx]
             cached_query = self.rkv_query_cache.get(req_id)
-            if cached_query is None:
+            if cached_query is None or cached_query.shape[0] < self.rkv_compressor.window_size:
                 continue
 
             key_states, value_states = self._gather_rkv_kv(req_idx, seq_len, attn_metadata.block_tables)
