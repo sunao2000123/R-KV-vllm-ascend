@@ -57,7 +57,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.rkv import RKVCompressor
+from vllm_ascend.rkv import RKVCompressor, rkv_trace_log, rkv_trace_timer
 from vllm_ascend.utils import weak_ref_tensors
 
 # default max value of sliding window size
@@ -407,6 +407,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             else None
         )
         self.rkv_query_cache: dict[str, torch.Tensor] = {}
+        rkv_trace_log(
+            "backend_init",
+            enabled=self.rkv_enabled,
+            budget=envs_ascend.VLLM_ASCEND_RKV_BUDGET,
+            buffer=envs_ascend.VLLM_ASCEND_RKV_BUFFER,
+            window_size=envs_ascend.VLLM_ASCEND_RKV_WINDOW_SIZE,
+            kernel_size=envs_ascend.VLLM_ASCEND_RKV_KERNEL_SIZE,
+            mix_lambda=envs_ascend.VLLM_ASCEND_RKV_MIX_LAMBDA,
+            retain_ratio=envs_ascend.VLLM_ASCEND_RKV_RETAIN_RATIO,
+            retain_direction=envs_ascend.VLLM_ASCEND_RKV_RETAIN_DIRECTION,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+        )
 
     @staticmethod
     def update_graph_params(
@@ -954,25 +968,44 @@ class AscendAttentionBackendImpl(AttentionImpl):
         return output
 
     def _rkv_runtime_enabled(self, query: torch.Tensor, attn_metadata: AscendMetadata) -> bool:
+        def disabled(reason: str) -> bool:
+            rkv_trace_log(
+                "runtime_skip",
+                reason=reason,
+                attn_state=getattr(attn_metadata.attn_state, "name", attn_metadata.attn_state),
+                query_dim=query.dim(),
+            )
+            return False
+
         if not self.rkv_enabled or self.rkv_compressor is None:
-            return False
+            return disabled("disabled_or_budget_unset")
         if _EXTRA_CTX.capturing or _EXTRA_CTX.is_draft_model:
-            return False
+            return disabled("capturing_or_draft_model")
         if self.vllm_config.speculative_config is not None or self.vllm_config.model_config.use_mla:
-            return False
+            return disabled("speculative_or_mla")
         if enable_cp() or self.sliding_window is not None or self.sinks is not None:
-            return False
+            return disabled("unsupported_attention_feature")
         if self.attn_type == AttentionType.ENCODER_DECODER:
-            return False
+            return disabled("encoder_decoder_attention")
         if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
-            return False
+            return disabled("not_decode_only")
         if self.key_cache is None or self.value_cache is None or attn_metadata.block_tables is None:
-            return False
+            return disabled("kv_cache_or_block_table_missing")
         if self.key_cache.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            return False
+            return disabled("unsupported_kv_cache_dtype")
         if query.dim() != 3 or attn_metadata.rkv_req_ids is None:
-            return False
-        return len(attn_metadata.rkv_req_ids) > 0 and len(attn_metadata.seq_lens_list) > 0
+            return disabled("unsupported_query_or_missing_req_ids")
+        enabled = len(attn_metadata.rkv_req_ids) > 0 and len(attn_metadata.seq_lens_list) > 0
+        if not enabled:
+            return disabled("empty_req_or_seq_list")
+        rkv_trace_log(
+            "runtime_enabled",
+            req_count=len(attn_metadata.rkv_req_ids),
+            seq_count=len(attn_metadata.seq_lens_list),
+            query_shape=tuple(query.shape),
+            kv_cache_dtype=self.key_cache.dtype,
+        )
+        return True
 
     def _rkv_trigger_len(self) -> int:
         assert self.rkv_compressor is not None
@@ -988,12 +1021,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         assert self.rkv_compressor is not None
         for req_id in attn_metadata.rkv_reset_req_ids or []:
             self.rkv_query_cache.pop(req_id, None)
+            rkv_trace_log("query_cache_reset", req_id=req_id)
 
         req_ids = attn_metadata.rkv_req_ids or []
         active_req_ids = set(req_ids)
         for cached_req_id in list(self.rkv_query_cache):
             if cached_req_id not in active_req_ids:
                 self.rkv_query_cache.pop(cached_req_id, None)
+                rkv_trace_log("query_cache_drop_inactive", req_id=cached_req_id)
         num_reqs = min(
             len(req_ids),
             len(attn_metadata.actual_seq_lengths_q),
@@ -1008,6 +1043,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
             req_id = req_ids[req_idx]
             if int(attn_metadata.seq_lens_list[req_idx]) < cache_start_len:
                 self.rkv_query_cache.pop(req_id, None)
+                rkv_trace_log(
+                    "query_cache_skip_before_start",
+                    req_id=req_id,
+                    seq_len=int(attn_metadata.seq_lens_list[req_idx]),
+                    cache_start_len=cache_start_len,
+                )
                 query_start = query_end
                 continue
             current_query = query[query_start:query_end].detach()
@@ -1017,6 +1058,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             else:
                 cached_query = torch.cat((cached_query, current_query), dim=0)
             self.rkv_query_cache[req_id] = cached_query[-self.rkv_compressor.window_size :]
+            rkv_trace_log(
+                "query_cache_append",
+                req_id=req_id,
+                seq_len=int(attn_metadata.seq_lens_list[req_idx]),
+                query_tokens=query_end - query_start,
+                cached_tokens=self.rkv_query_cache[req_id].shape[0],
+                cache_start_len=cache_start_len,
+                window_size=self.rkv_compressor.window_size,
+            )
             query_start = query_end
 
     def _gather_rkv_kv(
@@ -1077,29 +1127,73 @@ class AscendAttentionBackendImpl(AttentionImpl):
             compressed_lens = [0] * num_reqs
 
         trigger_len = self._rkv_trigger_len()
+        rkv_trace_log(
+            "compress_scan",
+            req_count=num_reqs,
+            trigger_len=trigger_len,
+            budget=self.rkv_compressor.budget,
+            buffer=envs_ascend.VLLM_ASCEND_RKV_BUFFER,
+        )
         has_compressed = False
         for req_idx in range(num_reqs):
             seq_len = int(attn_metadata.seq_lens_list[req_idx])
+            req_id = req_ids[req_idx]
             if seq_len < trigger_len:
+                rkv_trace_log(
+                    "compress_skip",
+                    reason="before_trigger",
+                    req_id=req_id,
+                    seq_len=seq_len,
+                    trigger_len=trigger_len,
+                )
                 continue
 
-            req_id = req_ids[req_idx]
             cached_query = self.rkv_query_cache.get(req_id)
             if cached_query is None or cached_query.shape[0] < self.rkv_compressor.window_size:
+                rkv_trace_log(
+                    "compress_skip",
+                    reason="query_window_not_ready",
+                    req_id=req_id,
+                    seq_len=seq_len,
+                    cached_tokens=0 if cached_query is None else cached_query.shape[0],
+                    window_size=self.rkv_compressor.window_size,
+                )
                 continue
 
-            key_states, value_states = self._gather_rkv_kv(req_idx, seq_len, attn_metadata.block_tables)
-            query_states = cached_query.transpose(0, 1).unsqueeze(0).contiguous()
-            key_states, value_states = self.rkv_compressor.update_kv(
-                key_states,
-                query_states,
-                value_states,
-            )
-            compressed_lens[req_idx] = self._write_rkv_kv(
-                req_idx,
-                key_states,
-                value_states,
-                attn_metadata.block_tables,
+            with rkv_trace_timer(
+                "attention.compress_total",
+                query,
+                req_id=req_id,
+                seq_len=seq_len,
+                cached_query_tokens=cached_query.shape[0],
+            ):
+                with rkv_trace_timer("attention.gather_kv", self.key_cache, req_id=req_id, seq_len=seq_len):
+                    key_states, value_states = self._gather_rkv_kv(req_idx, seq_len, attn_metadata.block_tables)
+                query_states = cached_query.transpose(0, 1).unsqueeze(0).contiguous()
+                with rkv_trace_timer("attention.update_kv_total", key_states, req_id=req_id, seq_len=seq_len):
+                    key_states, value_states = self.rkv_compressor.update_kv(
+                        key_states,
+                        query_states,
+                        value_states,
+                    )
+                with rkv_trace_timer(
+                    "attention.write_kv",
+                    self.key_cache,
+                    req_id=req_id,
+                    compressed_len=key_states.shape[-2],
+                ):
+                    compressed_lens[req_idx] = self._write_rkv_kv(
+                        req_idx,
+                        key_states,
+                        value_states,
+                        attn_metadata.block_tables,
+                    )
+            rkv_trace_log(
+                "compress_done",
+                req_id=req_id,
+                old_len=seq_len,
+                new_len=compressed_lens[req_idx],
+                budget=self.rkv_compressor.budget,
             )
             self.rkv_query_cache.pop(req_id, None)
             has_compressed = True

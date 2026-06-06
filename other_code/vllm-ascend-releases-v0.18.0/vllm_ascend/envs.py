@@ -125,6 +125,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_RKV_RETAIN_RATIO": lambda: float(os.getenv("VLLM_ASCEND_RKV_RETAIN_RATIO", "0.2")),
     # Similar-key representative direction: last, first, last_percent, first_percent.
     "VLLM_ASCEND_RKV_RETAIN_DIRECTION": lambda: os.getenv("VLLM_ASCEND_RKV_RETAIN_DIRECTION", "last"),
+    # Emit R-KV enablement and latency checkpoints for service debugging.
+    "VLLM_ASCEND_RKV_TRACE": lambda: bool(int(os.getenv("VLLM_ASCEND_RKV_TRACE", "0"))),
 }
 
 # end-env-vars-definition
