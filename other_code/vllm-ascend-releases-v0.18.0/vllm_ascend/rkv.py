@@ -177,7 +177,7 @@ class RKVCompressor:
         mix_lambda: float = 0.07,
         retain_ratio: float = 0.2,
         retain_direction: str = "last",
-        similarity_sample_size: int = 128,
+        similarity_sample_size: int = 16,
     ) -> None:
         if budget <= window_size:
             raise ValueError("R-KV budget must be greater than window_size")

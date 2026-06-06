@@ -114,7 +114,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Target compressed KV cache length. R-KV is disabled when this is <= 0.
     "VLLM_ASCEND_RKV_BUDGET": lambda: int(os.getenv("VLLM_ASCEND_RKV_BUDGET", "0")),
     # Compress again only after the effective KV length grows by this buffer.
-    "VLLM_ASCEND_RKV_BUFFER": lambda: int(os.getenv("VLLM_ASCEND_RKV_BUFFER", "128")),
+    "VLLM_ASCEND_RKV_BUFFER": lambda: int(os.getenv("VLLM_ASCEND_RKV_BUFFER", "512")),
     # Recent query/KV observation window used by R-KV scoring.
     "VLLM_ASCEND_RKV_WINDOW_SIZE": lambda: int(os.getenv("VLLM_ASCEND_RKV_WINDOW_SIZE", "8")),
     # Max-pooling kernel size for attention importance smoothing.
@@ -127,7 +127,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_RKV_RETAIN_DIRECTION": lambda: os.getenv("VLLM_ASCEND_RKV_RETAIN_DIRECTION", "last"),
     # Max source rows sampled for redundancy scoring. Set 0 to use exact all-pairs similarity.
     "VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE": lambda: int(
-        os.getenv("VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE", "128")
+        os.getenv("VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE", "16")
     ),
 }
 
