@@ -787,6 +787,10 @@ class NPUPlatform(Platform):
 
         # ==================== 2. Cache Config ====================
         cache_config = vllm_config.cache_config
+        rkv_enabled = (
+            envs_ascend.VLLM_ASCEND_RKV_ENABLE
+            and envs_ascend.VLLM_ASCEND_RKV_BUDGET > 0
+        )
         if cache_config:
             # Check and reset cpu_kvcache_space_bytes
             if getattr(cache_config, "cpu_kvcache_space_bytes", False):
@@ -795,16 +799,25 @@ class NPUPlatform(Platform):
                 )
                 cache_config.cpu_kvcache_space_bytes = None
 
-            if (
-                envs_ascend.VLLM_ASCEND_RKV_ENABLE
-                and envs_ascend.VLLM_ASCEND_RKV_BUDGET > 0
-                and getattr(cache_config, "enable_prefix_caching", None) is not False
-            ):
+            if rkv_enabled and getattr(cache_config, "enable_prefix_caching", None) is not False:
                 logger.warning(
                     "R-KV is incompatible with prefix caching because it rewrites KV cache blocks in-place. "
                     "Disabling prefix caching for this run."
                 )
                 cache_config.enable_prefix_caching = False
+
+        if rkv_enabled:
+            from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+            compilation_config = vllm_config.compilation_config
+            cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
+            if cudagraph_mode not in (None, CUDAGraphMode.NONE):
+                logger.warning(
+                    "R-KV is incompatible with ACL graph because it rewrites KV cache blocks and updates effective "
+                    "KV lengths dynamically. Disabling ACL graph for this run."
+                )
+                compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+                compilation_config.mode = CompilationMode.NONE
 
         # ==================== 3. MultiModal Config ====================
         multimodal_config = getattr(model_config, "multimodal_config", None) if model_config else None
