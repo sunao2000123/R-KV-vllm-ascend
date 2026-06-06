@@ -132,6 +132,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Token selection mode: aggregate follows the paper's mean-over-heads score;
     # per_head preserves the reference implementation's independent head picks.
     "VLLM_ASCEND_RKV_SELECTION_MODE": lambda: os.getenv("VLLM_ASCEND_RKV_SELECTION_MODE", "aggregate"),
+    # Reuse one R-KV token selection across attention layers in the same
+    # compression step. This keeps the paper-style sequence-level selection
+    # while avoiding full-cache gather/scoring once per layer.
+    "VLLM_ASCEND_RKV_SHARE_SELECTION": lambda: bool(int(os.getenv("VLLM_ASCEND_RKV_SHARE_SELECTION", "1"))),
 }
 
 # end-env-vars-definition
