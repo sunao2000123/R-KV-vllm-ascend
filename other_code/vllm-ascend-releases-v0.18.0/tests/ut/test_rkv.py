@@ -1,13 +1,8 @@
 import unittest
-from unittest.mock import patch
 
 import torch
 
-from vllm_ascend.rkv import (
-    RKVCompressor,
-    calculate_sampled_similarity,
-    calculate_similarity,
-)
+from vllm_ascend.rkv import RKVCompressor, calculate_similarity
 
 
 def _reference_similarity_last(
@@ -30,27 +25,12 @@ def _reference_similarity_last(
 
 class TestRKVCompressor(unittest.TestCase):
 
-    def test_calculate_similarity_matches_reference_with_chunking(self):
+    def test_calculate_similarity_matches_reference_last_retain(self):
         torch.manual_seed(0)
         key_states = torch.randn(1, 2, 9, 4)
 
-        with patch("vllm_ascend.rkv._SIMILARITY_MAX_CHUNK", 2):
-            actual = calculate_similarity(key_states, threshold=0.25, retain_direction="last")
-
+        actual = calculate_similarity(key_states, threshold=0.25, retain_direction="last")
         expected = _reference_similarity_last(key_states, threshold=0.25)
-        torch.testing.assert_close(actual, expected)
-
-    def test_calculate_sampled_similarity_matches_exact_when_sampling_all_rows(self):
-        torch.manual_seed(0)
-        key_states = torch.randn(1, 2, 9, 4)
-
-        actual = calculate_sampled_similarity(
-            key_states,
-            sample_size=9,
-            threshold=0.25,
-            retain_direction="last",
-        )
-        expected = calculate_similarity(key_states, threshold=0.25, retain_direction="last")
 
         torch.testing.assert_close(actual, expected)
 
@@ -72,59 +52,25 @@ class TestRKVCompressor(unittest.TestCase):
         torch.testing.assert_close(compressed_key[:, :, -2:, :], key_states[:, :, -2:, :])
         torch.testing.assert_close(compressed_value[:, :, -2:, :], value_states[:, :, -2:, :])
 
-    def test_select_indices_defaults_to_paper_aggregate_mode(self):
+    def test_update_kv_returns_original_when_under_budget(self):
         torch.manual_seed(0)
-        compressor = RKVCompressor(budget=6, window_size=2, kernel_size=3)
-        key_states = torch.randn(1, 2, 12, 4)
-        query_states = torch.randn(1, 4, 2, 4)
-
-        selection = compressor.select_indices(key_states, query_states)
-
-        self.assertIsNotNone(selection)
-        indices, observation = selection
-        self.assertEqual(observation, 2)
-        self.assertEqual(indices.shape, (1, 4))
-
-    def test_select_indices_preserves_per_head_mode(self):
-        torch.manual_seed(0)
-        compressor = RKVCompressor(
-            budget=6,
-            window_size=2,
-            kernel_size=3,
-            selection_mode="per_head",
-        )
-        key_states = torch.randn(1, 2, 12, 4)
-        query_states = torch.randn(1, 4, 2, 4)
-
-        selection = compressor.select_indices(key_states, query_states)
-
-        self.assertIsNotNone(selection)
-        indices, observation = selection
-        self.assertEqual(observation, 2)
-        self.assertEqual(indices.shape, (1, 2, 4))
-
-    def test_update_kv_uses_sampled_similarity_for_large_cache(self):
-        torch.manual_seed(0)
-        compressor = RKVCompressor(
-            budget=6,
-            window_size=2,
-            kernel_size=3,
-            similarity_sample_size=4,
-        )
+        compressor = RKVCompressor(budget=16, window_size=2, kernel_size=3)
         key_states = torch.randn(1, 2, 12, 4)
         value_states = torch.randn(1, 2, 12, 4)
         query_states = torch.randn(1, 4, 2, 4)
 
-        with patch("vllm_ascend.rkv.calculate_similarity") as mock_exact:
-            compressed_key, compressed_value = compressor.update_kv(
-                key_states,
-                query_states,
-                value_states,
-            )
+        compressed_key, compressed_value = compressor.update_kv(
+            key_states,
+            query_states,
+            value_states,
+        )
 
-        mock_exact.assert_not_called()
-        self.assertEqual(compressed_key.shape, (1, 2, 6, 4))
-        self.assertEqual(compressed_value.shape, (1, 2, 6, 4))
+        self.assertIs(compressed_key, key_states)
+        self.assertIs(compressed_value, value_states)
+
+    def test_budget_must_exceed_window(self):
+        with self.assertRaisesRegex(ValueError, "greater than window_size"):
+            RKVCompressor(budget=8, window_size=8)
 
 
 if __name__ == "__main__":

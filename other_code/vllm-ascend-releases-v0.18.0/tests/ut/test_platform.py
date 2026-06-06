@@ -179,22 +179,6 @@ class TestNPUPlatform(TestBase):
         self.assertFalse(vllm_config.cache_config.enable_prefix_caching)
         self.assertTrue("R-KV is incompatible with prefix caching" in cm.output[0])
 
-    @patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_RKV_BUDGET", 1024)
-    @patch("vllm_ascend.platform.envs_ascend.VLLM_ASCEND_RKV_ENABLE", True)
-    def test_fix_incompatible_config_disables_acl_graph_for_rkv(self):
-        vllm_config = TestNPUPlatform.mock_vllm_config()
-        vllm_config.cache_config.enable_prefix_caching = False
-        vllm_config.cache_config.cpu_kvcache_space_bytes = None
-        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
-        vllm_config.compilation_config.mode = CompilationMode.VLLM_COMPILE
-
-        with self.assertLogs(logger="vllm", level="WARNING") as cm:
-            self.platform._fix_incompatible_config(vllm_config)
-
-        self.assertEqual(vllm_config.compilation_config.cudagraph_mode, CUDAGraphMode.NONE)
-        self.assertEqual(vllm_config.compilation_config.mode, CompilationMode.NONE)
-        self.assertTrue(any("R-KV is incompatible with ACL graph" in msg for msg in cm.output))
-
     @patch("vllm_ascend.platform.refresh_block_size")
     @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
     @patch("vllm_ascend.platform.enable_sp", return_value=False)
