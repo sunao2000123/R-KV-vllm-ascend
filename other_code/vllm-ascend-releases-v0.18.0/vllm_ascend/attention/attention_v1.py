@@ -1085,7 +1085,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
             req_id = req_ids[req_idx]
             cached_query = self.rkv_query_cache.get(req_id)
-            if cached_query is None or cached_query.shape[0] < self.rkv_compressor.window_size:
+            if cached_query is None or cached_query.shape[0] == 0:
                 continue
 
             key_states, value_states = self._gather_rkv_kv(req_idx, seq_len, attn_metadata.block_tables)

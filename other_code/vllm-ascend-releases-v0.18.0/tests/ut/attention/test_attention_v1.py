@@ -265,18 +265,30 @@ class TestAscendAttentionBackendImpl(TestBase):
 
     @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
     @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
-    def test_rkv_compression_waits_for_query_window(self, mock_extra_ctx,
-                                                    mock_enable_cp):
+    def test_rkv_compression_runs_with_available_query(self, mock_extra_ctx,
+                                                       mock_enable_cp):
         self._enable_rkv_for_test()
         mock_extra_ctx.capturing = False
         mock_extra_ctx.is_draft_model = False
-        self.impl.rkv_query_cache["req"] = torch.randn(7, 8, 64)
-        metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly, seq_len=4096)
+        self.impl.rkv_query_cache["req"] = torch.randn(1, 8, 64)
+        metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly,
+                                      seq_len=4096)
+        key_states = torch.randn(1, 8, 16, 64)
+        value_states = torch.randn(1, 8, 16, 64)
+        self.impl.rkv_compressor.update_kv.return_value = (
+            torch.randn(1, 8, 1024, 64),
+            torch.randn(1, 8, 1024, 64),
+        )
 
-        with patch.object(self.impl, '_gather_rkv_kv') as mock_gather:
+        with patch.object(self.impl, '_gather_rkv_kv',
+                          return_value=(key_states, value_states)) as mock_gather, \
+                patch.object(self.impl, '_write_rkv_kv',
+                             return_value=1024) as mock_write:
             self.impl._maybe_compress_rkv(torch.randn(1, 8, 64), metadata)
 
-        mock_gather.assert_not_called()
+        mock_gather.assert_called_once()
+        self.impl.rkv_compressor.update_kv.assert_called_once()
+        mock_write.assert_called_once()
 
     @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
     @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
