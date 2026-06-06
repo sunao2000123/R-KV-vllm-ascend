@@ -10,6 +10,10 @@ import torch
 import torch.nn.functional as F
 
 
+_SIMILARITY_MAX_CHUNK = 256
+_SIMILARITY_MAX_PAIR_ELEMENTS = 2 * 1024 * 1024
+
+
 def compute_attention_scores(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
@@ -39,6 +43,40 @@ def compute_attention_scores(
     raise ValueError(f"Unsupported R-KV pooling method: {pooling}")
 
 
+def _similarity_chunk_size(seq_len: int) -> int:
+    return min(_SIMILARITY_MAX_CHUNK, max(1, _SIMILARITY_MAX_PAIR_ELEMENTS // max(1, seq_len)))
+
+
+def _select_retain_indices(
+    similarity_mask: torch.Tensor,
+    retain_ratio: float,
+    retain_direction: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_len = similarity_mask.size(-1)
+    valid = similarity_mask.any(dim=-1)
+
+    if retain_direction == "last":
+        retain = seq_len - 1 - similarity_mask.flip(-1).to(torch.long).argmax(dim=-1)
+    elif retain_direction == "first":
+        retain = similarity_mask.to(torch.long).argmax(dim=-1)
+    elif retain_direction in ("last_percent", "first_percent"):
+        topk = min(seq_len, max(1, int(seq_len * retain_ratio)))
+        seq_indices = torch.arange(seq_len, device=similarity_mask.device, dtype=torch.long)
+        seq_indices = seq_indices.unsqueeze(0).expand_as(similarity_mask)
+        if retain_direction == "last_percent":
+            masked_indices = seq_indices.masked_fill(~similarity_mask, -1)
+            retain = torch.topk(masked_indices, k=topk, dim=-1).values[:, -1]
+            valid = retain >= 0
+        else:
+            masked_indices = seq_indices.masked_fill(~similarity_mask, seq_len)
+            retain = torch.topk(masked_indices, k=topk, dim=-1, largest=False).values[:, -1]
+            valid = retain < seq_len
+    else:
+        raise ValueError(f"Unsupported R-KV retain direction: {retain_direction}")
+
+    return retain, valid
+
+
 def calculate_similarity(
     key_states: torch.Tensor,
     threshold: float = 0.5,
@@ -51,41 +89,30 @@ def calculate_similarity(
     penalized, while one representative similar key is retained.
     """
     key_states = key_states[0]
-    num_heads = key_states.shape[0]
+    num_heads, seq_len = key_states.shape[:2]
 
     key_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
-    similarity_cos = torch.matmul(key_norm, key_norm.transpose(-1, -2))
+    chunk_size = _similarity_chunk_size(seq_len)
+    redundancy_scores = torch.empty((num_heads, seq_len), device=key_states.device, dtype=key_states.dtype)
 
     for head_idx in range(num_heads):
-        similarity_cos[head_idx].fill_diagonal_(0.0)
+        head_key_norm = key_norm[head_idx]
+        score_sum = torch.zeros(seq_len, device=key_states.device, dtype=key_states.dtype)
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            similarity_chunk = torch.matmul(head_key_norm[start:end], head_key_norm.transpose(0, 1))
+            diagonal = torch.arange(start, end, device=key_states.device)
+            similarity_chunk[torch.arange(end - start, device=key_states.device), diagonal] = 0.0
 
-    similarity_mask = similarity_cos > threshold
-    seq_len = similarity_mask.size(-1)
-    topk = min(seq_len, max(1, int(seq_len * retain_ratio)))
-    seq_indices = torch.arange(seq_len, device=similarity_mask.device)
+            similarity_mask = similarity_chunk > threshold
+            retain, valid = _select_retain_indices(similarity_mask, retain_ratio, retain_direction)
+            row_idx = torch.arange(end - start, device=key_states.device)[valid]
+            similarity_chunk[row_idx, retain[valid]] = 0.0
+            score_sum += similarity_chunk.sum(dim=0)
 
-    indices = torch.where(
-        similarity_mask,
-        seq_indices,
-        torch.zeros_like(similarity_mask, dtype=torch.long),
-    )
+        redundancy_scores[head_idx] = score_sum / seq_len
 
-    if retain_direction == "last":
-        similarity_retain = torch.max(indices, dim=-1)[0]
-    elif retain_direction == "first":
-        similarity_retain = torch.min(indices, dim=-1)[0]
-    elif retain_direction == "last_percent":
-        similarity_retain = torch.topk(indices, k=topk, dim=-1)[0][:, :, 0]
-    elif retain_direction == "first_percent":
-        similarity_retain = torch.topk(indices, k=topk, dim=-1, largest=False)[0][:, :, -1]
-    else:
-        raise ValueError(f"Unsupported R-KV retain direction: {retain_direction}")
-
-    batch_idx = torch.arange(num_heads, device=key_states.device).unsqueeze(1).repeat(1, similarity_retain.size(1))
-    seq_idx = torch.arange(similarity_retain.size(1), device=key_states.device).unsqueeze(0).repeat(num_heads, 1)
-    similarity_cos[batch_idx, seq_idx, similarity_retain] = 0
-
-    return similarity_cos.mean(dim=1).softmax(dim=-1)
+    return redundancy_scores.softmax(dim=-1)
 
 
 class RKVCompressor:
