@@ -403,6 +403,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 retain_ratio=envs_ascend.VLLM_ASCEND_RKV_RETAIN_RATIO,
                 retain_direction=envs_ascend.VLLM_ASCEND_RKV_RETAIN_DIRECTION,
                 similarity_sample_size=envs_ascend.VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE,
+                selection_mode=envs_ascend.VLLM_ASCEND_RKV_SELECTION_MODE,
             )
             if self.rkv_enabled
             else None
@@ -1046,6 +1047,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value_states = value_states.transpose(0, 1).unsqueeze(0).contiguous()
         return key_states, value_states
 
+    def _gather_rkv_key(
+        self,
+        req_idx: int,
+        seq_len: int,
+        block_tables: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.key_cache is not None
+        block_size = self.key_cache.shape[1]
+        num_blocks = cdiv(seq_len, block_size)
+        block_ids = block_tables[req_idx, :num_blocks].to(dtype=torch.long)
+
+        key_states = self.key_cache.index_select(0, block_ids).reshape(
+            -1,
+            self.num_kv_heads,
+            self.head_size,
+        )[:seq_len]
+
+        return key_states.transpose(0, 1).unsqueeze(0).contiguous()
+
     def _write_rkv_kv(
         self,
         req_idx: int,
@@ -1064,6 +1084,54 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value_flat = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
         key_flat.index_copy_(0, slots, key_states.squeeze(0).transpose(0, 1).contiguous())
         value_flat.index_copy_(0, slots, value_states.squeeze(0).transpose(0, 1).contiguous())
+        return new_seq_len
+
+    def _write_rkv_selection(
+        self,
+        req_idx: int,
+        seq_len: int,
+        indices: torch.Tensor,
+        observation: int,
+        block_tables: torch.Tensor,
+    ) -> int:
+        assert self.key_cache is not None and self.value_cache is not None
+        block_size = self.key_cache.shape[1]
+        device = self.key_cache.device
+
+        source_positions = torch.arange(seq_len, device=device, dtype=torch.long)
+        source_block_ids = block_tables[req_idx, source_positions // block_size].to(dtype=torch.long)
+        source_slots = source_block_ids * block_size + source_positions % block_size
+
+        key_flat = self.key_cache.view(-1, self.num_kv_heads, self.head_size)
+        value_flat = self.value_cache.view(-1, self.num_kv_heads, self.head_size)
+
+        if indices.dim() == 2:
+            old_slots = source_slots[indices.squeeze(0)]
+            key_old = key_flat.index_select(0, old_slots)
+            value_old = value_flat.index_select(0, old_slots)
+        else:
+            old_slots_by_head = source_slots[indices.squeeze(0)]
+            head_indices = torch.arange(self.num_kv_heads, device=device, dtype=torch.long)
+            head_indices = head_indices.unsqueeze(1).expand_as(old_slots_by_head)
+            key_old = key_flat[old_slots_by_head, head_indices].transpose(0, 1).contiguous()
+            value_old = value_flat[old_slots_by_head, head_indices].transpose(0, 1).contiguous()
+
+        if observation > 0:
+            recent_slots = source_slots[-observation:]
+            key_recent = key_flat.index_select(0, recent_slots)
+            value_recent = value_flat.index_select(0, recent_slots)
+            key_states = torch.cat((key_old, key_recent), dim=0)
+            value_states = torch.cat((value_old, value_recent), dim=0)
+        else:
+            key_states = key_old
+            value_states = value_old
+
+        new_seq_len = key_states.shape[0]
+        target_positions = torch.arange(new_seq_len, device=device, dtype=torch.long)
+        target_block_ids = block_tables[req_idx, target_positions // block_size].to(dtype=torch.long)
+        target_slots = target_block_ids * block_size + target_positions % block_size
+        key_flat.index_copy_(0, target_slots, key_states)
+        value_flat.index_copy_(0, target_slots, value_states)
         return new_seq_len
 
     def _maybe_compress_rkv(self, query: torch.Tensor, attn_metadata: AscendMetadata) -> None:
@@ -1089,17 +1157,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if cached_query is None or cached_query.shape[0] == 0:
                 continue
 
-            key_states, value_states = self._gather_rkv_kv(req_idx, seq_len, attn_metadata.block_tables)
+            key_states = self._gather_rkv_key(req_idx, seq_len, attn_metadata.block_tables)
             query_states = cached_query.transpose(0, 1).unsqueeze(0).contiguous()
-            key_states, value_states = self.rkv_compressor.update_kv(
+            selection = self.rkv_compressor.select_indices(
                 key_states,
                 query_states,
-                value_states,
             )
-            compressed_lens[req_idx] = self._write_rkv_kv(
+            if selection is None:
+                continue
+            indices, observation = selection
+            compressed_lens[req_idx] = self._write_rkv_selection(
                 req_idx,
-                key_states,
-                value_states,
+                seq_len,
+                indices,
+                observation,
                 attn_metadata.block_tables,
             )
             self.rkv_query_cache.pop(req_id, None)

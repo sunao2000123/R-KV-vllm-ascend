@@ -72,6 +72,37 @@ class TestRKVCompressor(unittest.TestCase):
         torch.testing.assert_close(compressed_key[:, :, -2:, :], key_states[:, :, -2:, :])
         torch.testing.assert_close(compressed_value[:, :, -2:, :], value_states[:, :, -2:, :])
 
+    def test_select_indices_defaults_to_paper_aggregate_mode(self):
+        torch.manual_seed(0)
+        compressor = RKVCompressor(budget=6, window_size=2, kernel_size=3)
+        key_states = torch.randn(1, 2, 12, 4)
+        query_states = torch.randn(1, 4, 2, 4)
+
+        selection = compressor.select_indices(key_states, query_states)
+
+        self.assertIsNotNone(selection)
+        indices, observation = selection
+        self.assertEqual(observation, 2)
+        self.assertEqual(indices.shape, (1, 4))
+
+    def test_select_indices_preserves_per_head_mode(self):
+        torch.manual_seed(0)
+        compressor = RKVCompressor(
+            budget=6,
+            window_size=2,
+            kernel_size=3,
+            selection_mode="per_head",
+        )
+        key_states = torch.randn(1, 2, 12, 4)
+        query_states = torch.randn(1, 4, 2, 4)
+
+        selection = compressor.select_indices(key_states, query_states)
+
+        self.assertIsNotNone(selection)
+        indices, observation = selection
+        self.assertEqual(observation, 2)
+        self.assertEqual(indices.shape, (1, 2, 4))
+
     def test_update_kv_uses_sampled_similarity_for_large_cache(self):
         torch.manual_seed(0)
         compressor = RKVCompressor(

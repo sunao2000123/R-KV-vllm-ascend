@@ -174,13 +174,16 @@ class RKVCompressor:
         budget: int,
         window_size: int = 8,
         kernel_size: int = 7,
-        mix_lambda: float = 0.07,
-        retain_ratio: float = 0.2,
+        mix_lambda: float = 0.1,
+        retain_ratio: float = 0.1,
         retain_direction: str = "last",
         similarity_sample_size: int = 16,
+        selection_mode: str = "aggregate",
     ) -> None:
         if budget <= window_size:
             raise ValueError("R-KV budget must be greater than window_size")
+        if selection_mode not in ("aggregate", "per_head"):
+            raise ValueError(f"Unsupported R-KV selection mode: {selection_mode}")
         self.budget = budget
         self.window_size = window_size
         self.kernel_size = kernel_size
@@ -188,6 +191,7 @@ class RKVCompressor:
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
         self.similarity_sample_size = max(0, similarity_sample_size)
+        self.selection_mode = selection_mode
 
     def _calculate_similarity(self, key_states: torch.Tensor) -> torch.Tensor:
         kv_cache_len = key_states.shape[-2]
@@ -204,21 +208,25 @@ class RKVCompressor:
             retain_direction=self.retain_direction,
         )
 
-    def update_kv(
+    def select_indices(
         self,
         key_states: torch.Tensor,
         query_states: torch.Tensor,
-        value_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        head_dim = query_states.shape[-1]
+    ) -> tuple[torch.Tensor, int] | None:
         kv_cache_len = key_states.shape[-2]
 
         if kv_cache_len <= self.budget:
-            return key_states, value_states
+            return None
 
         observation = min(self.window_size, query_states.shape[-2], kv_cache_len - 1)
         if observation <= 0:
-            return key_states[:, :, -self.budget :, :], value_states[:, :, -self.budget :, :]
+            indices = torch.arange(
+                kv_cache_len - self.budget,
+                kv_cache_len,
+                device=key_states.device,
+                dtype=torch.long,
+            ).unsqueeze(0)
+            return indices, 0
 
         attn_weights = compute_attention_scores(query_states, key_states)
         attn_weights_sum = (
@@ -241,11 +249,39 @@ class RKVCompressor:
         final_score = attn_cache * self.mix_lambda - similarity_cos * (1 - self.mix_lambda)
 
         keep_old = self.budget - observation
-        indices = final_score.topk(keep_old, dim=-1).indices
-        indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+        if self.selection_mode == "aggregate":
+            # Algorithm 1 in the paper aggregates head scores before top-k
+            # selection, yielding one token set shared by all KV heads. This is
+            # also a better fit for vLLM's block-table cache layout.
+            indices = final_score.mean(dim=1).topk(keep_old, dim=-1).indices
+        else:
+            indices = final_score.topk(keep_old, dim=-1).indices
 
-        key_past = key_states[:, :, :-observation, :].gather(dim=2, index=indices)
-        value_past = value_states[:, :, :-observation, :].gather(dim=2, index=indices)
+        return indices, observation
+
+    def update_kv(
+        self,
+        key_states: torch.Tensor,
+        query_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        selection = self.select_indices(key_states, query_states)
+        if selection is None:
+            return key_states, value_states
+
+        indices, observation = selection
+        head_dim = query_states.shape[-1]
+        if observation <= 0:
+            gather_idx = indices.unsqueeze(1).unsqueeze(-1).expand(-1, key_states.shape[1], -1, head_dim)
+            return key_states.gather(dim=2, index=gather_idx), value_states.gather(dim=2, index=gather_idx)
+
+        if indices.dim() == 2:
+            gather_idx = indices.unsqueeze(1).unsqueeze(-1).expand(-1, key_states.shape[1], -1, head_dim)
+        else:
+            gather_idx = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+
+        key_past = key_states[:, :, :-observation, :].gather(dim=2, index=gather_idx)
+        value_past = value_states[:, :, :-observation, :].gather(dim=2, index=gather_idx)
         key_recent = key_states[:, :, -observation:, :]
         value_recent = value_states[:, :, -observation:, :]
 
