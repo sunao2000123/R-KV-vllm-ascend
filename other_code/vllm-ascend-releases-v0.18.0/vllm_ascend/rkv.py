@@ -115,6 +115,52 @@ def calculate_similarity(
     return redundancy_scores.softmax(dim=-1)
 
 
+def _sample_similarity_rows(seq_len: int, sample_size: int, device: torch.device) -> torch.Tensor:
+    sample_size = min(seq_len, max(1, sample_size))
+    if sample_size == seq_len:
+        return torch.arange(seq_len, device=device, dtype=torch.long)
+    if sample_size == 1:
+        return torch.tensor([seq_len - 1], device=device, dtype=torch.long)
+    return torch.arange(sample_size, device=device, dtype=torch.long) * (seq_len - 1) // (sample_size - 1)
+
+
+def calculate_sampled_similarity(
+    key_states: torch.Tensor,
+    sample_size: int,
+    threshold: float = 0.5,
+    retain_ratio: float = 0.2,
+    retain_direction: str = "last",
+) -> torch.Tensor:
+    """Approximate redundancy score using evenly sampled source rows.
+
+    Full R-KV cosine redundancy is O(seq_len^2) per layer. In decode service
+    mode that cost can dominate TPOT, so long caches use a bounded row sample
+    while preserving the same representative-retention rule.
+    """
+    key_states = key_states[0]
+    num_heads, seq_len = key_states.shape[:2]
+    sample_indices = _sample_similarity_rows(seq_len, sample_size, key_states.device)
+    sample_count = sample_indices.numel()
+
+    key_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
+    redundancy_scores = torch.empty((num_heads, seq_len), device=key_states.device, dtype=key_states.dtype)
+    sample_row_idx = torch.arange(sample_count, device=key_states.device)
+
+    for head_idx in range(num_heads):
+        head_key_norm = key_norm[head_idx]
+        sampled_key_norm = head_key_norm.index_select(0, sample_indices)
+        similarity = torch.matmul(sampled_key_norm, head_key_norm.transpose(0, 1))
+        similarity[sample_row_idx, sample_indices] = 0.0
+
+        similarity_mask = similarity > threshold
+        retain, valid = _select_retain_indices(similarity_mask, retain_ratio, retain_direction)
+        row_idx = sample_row_idx[valid]
+        similarity[row_idx, retain[valid]] = 0.0
+        redundancy_scores[head_idx] = similarity.sum(dim=0) / sample_count
+
+    return redundancy_scores.softmax(dim=-1)
+
+
 class RKVCompressor:
     """R-KV redundancy-aware KV cache compressor.
 
@@ -131,6 +177,7 @@ class RKVCompressor:
         mix_lambda: float = 0.07,
         retain_ratio: float = 0.2,
         retain_direction: str = "last",
+        similarity_sample_size: int = 128,
     ) -> None:
         if budget <= window_size:
             raise ValueError("R-KV budget must be greater than window_size")
@@ -140,6 +187,22 @@ class RKVCompressor:
         self.mix_lambda = mix_lambda
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
+        self.similarity_sample_size = max(0, similarity_sample_size)
+
+    def _calculate_similarity(self, key_states: torch.Tensor) -> torch.Tensor:
+        kv_cache_len = key_states.shape[-2]
+        if self.similarity_sample_size and kv_cache_len > self.similarity_sample_size:
+            return calculate_sampled_similarity(
+                key_states,
+                sample_size=self.similarity_sample_size,
+                retain_ratio=self.retain_ratio,
+                retain_direction=self.retain_direction,
+            )
+        return calculate_similarity(
+            key_states,
+            retain_ratio=self.retain_ratio,
+            retain_direction=self.retain_direction,
+        )
 
     def update_kv(
         self,
@@ -174,11 +237,7 @@ class RKVCompressor:
             stride=1,
         )
 
-        similarity_cos = calculate_similarity(
-            key_states,
-            retain_ratio=self.retain_ratio,
-            retain_direction=self.retain_direction,
-        )[:, :-observation]
+        similarity_cos = self._calculate_similarity(key_states)[:, :-observation]
         final_score = attn_cache * self.mix_lambda - similarity_cos * (1 - self.mix_lambda)
 
         keep_old = self.budget - observation

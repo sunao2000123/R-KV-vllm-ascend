@@ -402,6 +402,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 mix_lambda=envs_ascend.VLLM_ASCEND_RKV_MIX_LAMBDA,
                 retain_ratio=envs_ascend.VLLM_ASCEND_RKV_RETAIN_RATIO,
                 retain_direction=envs_ascend.VLLM_ASCEND_RKV_RETAIN_DIRECTION,
+                similarity_sample_size=envs_ascend.VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE,
             )
             if self.rkv_enabled
             else None

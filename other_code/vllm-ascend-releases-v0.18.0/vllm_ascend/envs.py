@@ -125,6 +125,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_RKV_RETAIN_RATIO": lambda: float(os.getenv("VLLM_ASCEND_RKV_RETAIN_RATIO", "0.2")),
     # Similar-key representative direction: last, first, last_percent, first_percent.
     "VLLM_ASCEND_RKV_RETAIN_DIRECTION": lambda: os.getenv("VLLM_ASCEND_RKV_RETAIN_DIRECTION", "last"),
+    # Max source rows sampled for redundancy scoring. Set 0 to use exact all-pairs similarity.
+    "VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE": lambda: int(
+        os.getenv("VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE", "128")
+    ),
 }
 
 # end-env-vars-definition
