@@ -317,11 +317,13 @@ class TestAscendAttentionBackendImpl(TestBase):
                           return_value=key_states) as mock_gather, \
                 patch.object(self.impl, '_write_rkv_selection',
                              return_value=1024) as mock_write:
-            self.impl._maybe_compress_rkv(torch.randn(1, 8, 64), metadata)
+            compressed_lens = self.impl._maybe_compress_rkv(
+                torch.randn(1, 8, 64), metadata)
 
         mock_gather.assert_called_once()
         self.impl.rkv_compressor.select_indices.assert_called_once()
         mock_write.assert_called_once()
+        self.assertEqual(compressed_lens, [1024])
 
     @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
     @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
@@ -374,6 +376,22 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_gather.assert_called_once()
         self.impl.rkv_compressor.select_indices.assert_called_once()
         self.assertEqual(mock_write.call_count, 2)
+
+    def test_rkv_compressed_lens_context_restores_metadata(self):
+        self._enable_rkv_for_test()
+        metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly,
+                                      seq_len=640)
+        metadata.seq_lens = torch.tensor([640], dtype=torch.int32)
+        metadata.seq_lens_cpu = torch.tensor([640], dtype=torch.int32)
+
+        with self.impl._use_rkv_compressed_lens(metadata, [512]):
+            self.assertEqual(metadata.seq_lens_list, [512])
+            self.assertEqual(metadata.seq_lens.item(), 512)
+            self.assertEqual(metadata.seq_lens_cpu.item(), 512)
+
+        self.assertEqual(metadata.seq_lens_list, [640])
+        self.assertEqual(metadata.seq_lens.item(), 640)
+        self.assertEqual(metadata.seq_lens_cpu.item(), 640)
 
     def test_forward_no_attn_metadata(self):
         """Test forward pass when attn_metadata is None"""

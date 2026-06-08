@@ -1336,9 +1336,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
         query: torch.Tensor,
         attn_metadata: AscendMetadata,
         runtime_checked: bool = False,
-    ) -> None:
+    ) -> list[int] | None:
         if not runtime_checked and not self._rkv_runtime_enabled(query, attn_metadata):
-            return
+            return None
 
         assert self.rkv_compressor is not None
         req_ids = attn_metadata.rkv_req_ids or []
@@ -1405,6 +1405,63 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         if has_compressed:
             attn_metadata.rkv_compressed_lens = compressed_lens
+            return compressed_lens
+        return None
+
+    @contextmanager
+    def _use_rkv_compressed_lens(
+        self,
+        attn_metadata: AscendMetadata,
+        compressed_lens: list[int] | None,
+    ) -> Iterator[None]:
+        if not compressed_lens:
+            yield
+            return
+
+        original_seq_lens_list = list(attn_metadata.seq_lens_list)
+        patched_seq_lens_list = list(original_seq_lens_list)
+        changed = False
+        for req_idx, compressed_len in enumerate(compressed_lens):
+            if req_idx >= len(patched_seq_lens_list):
+                break
+            if compressed_len > 0 and compressed_len < patched_seq_lens_list[req_idx]:
+                patched_seq_lens_list[req_idx] = int(compressed_len)
+                changed = True
+
+        if not changed:
+            yield
+            return
+
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        original_seq_lens = seq_lens.clone() if isinstance(seq_lens, torch.Tensor) else None
+        original_seq_lens_cpu = seq_lens_cpu.clone() if isinstance(seq_lens_cpu, torch.Tensor) else None
+
+        def _copy_seq_lens(seq_lens: torch.Tensor | None, values: list[int]) -> None:
+            if not isinstance(seq_lens, torch.Tensor):
+                return
+            num_lens = min(len(values), seq_lens.shape[0])
+            seq_lens[:num_lens].copy_(
+                torch.as_tensor(values[:num_lens], device=seq_lens.device, dtype=seq_lens.dtype)
+            )
+
+        try:
+            attn_metadata.seq_lens_list = patched_seq_lens_list
+            _copy_seq_lens(seq_lens, patched_seq_lens_list)
+            _copy_seq_lens(seq_lens_cpu, patched_seq_lens_list)
+            _rkv_breakpoint(
+                "timing_effective_len",
+                elapsed_ms="0.000",
+                original_seq_lens=original_seq_lens_list,
+                effective_seq_lens=patched_seq_lens_list,
+            )
+            yield
+        finally:
+            attn_metadata.seq_lens_list = original_seq_lens_list
+            if original_seq_lens is not None and isinstance(seq_lens, torch.Tensor):
+                seq_lens.copy_(original_seq_lens)
+            if original_seq_lens_cpu is not None and isinstance(seq_lens_cpu, torch.Tensor):
+                seq_lens_cpu.copy_(original_seq_lens_cpu)
 
     def forward(
         self,
@@ -1449,16 +1506,20 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self._forward_encoder_attention(query, key, value, attn_metadata, output)
             output[:num_tokens] = attn_output[:num_tokens]
             return output
-        if output_padded is not None:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
-        else:
-            attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
-        output[:num_tokens] = attn_output[:num_tokens]
+
+        rkv_compressed_lens = None
         if self.rkv_enabled and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
             rkv_runtime_enabled = self._rkv_runtime_enabled(query, attn_metadata)
             if rkv_runtime_enabled:
                 self._update_rkv_query_cache(query, attn_metadata, runtime_checked=True)
-                self._maybe_compress_rkv(query, attn_metadata, runtime_checked=True)
+                rkv_compressed_lens = self._maybe_compress_rkv(query, attn_metadata, runtime_checked=True)
+
+        with self._use_rkv_compressed_lens(attn_metadata, rkv_compressed_lens):
+            if output_padded is not None:
+                attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output_padded)
+            else:
+                attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
+        output[:num_tokens] = attn_output[:num_tokens]
         return output
 
 
