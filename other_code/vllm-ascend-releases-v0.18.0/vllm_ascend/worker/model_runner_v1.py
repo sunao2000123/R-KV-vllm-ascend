@@ -504,11 +504,22 @@ class NPUModelRunner(GPUModelRunner):
             yield from attn_metadata.values()
 
     def _get_rkv_compressed_lens(self, attn_metadata: PerLayerAttnMetadata) -> list[int] | None:
+        merged_lens: list[int] | None = None
         for metadata in self._iter_rkv_attn_metadata(attn_metadata):
             compressed_lens = getattr(metadata, "rkv_compressed_lens", None)
-            if compressed_lens:
-                return compressed_lens
-        return None
+            if not compressed_lens:
+                continue
+            if merged_lens is None:
+                merged_lens = [0] * len(compressed_lens)
+            elif len(merged_lens) < len(compressed_lens):
+                merged_lens.extend([0] * (len(compressed_lens) - len(merged_lens)))
+            for req_idx, compressed_len in enumerate(compressed_lens):
+                if compressed_len <= 0:
+                    continue
+                previous_len = merged_lens[req_idx]
+                if previous_len == 0 or compressed_len < previous_len:
+                    merged_lens[req_idx] = int(compressed_len)
+        return merged_lens
 
     def _update_rkv_effective_kv_lens(
         self,

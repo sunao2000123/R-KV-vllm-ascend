@@ -111,6 +111,31 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             {"reused", "finished", "preempted"},
         )
 
+    def test_rkv_effective_lens_merge_compressed_lens_across_layers(self):
+        runner = self._build_runner()
+        runner.rkv_current_enabled = True
+        runner.rkv_current_req_ids = ["req0", "req1", "req2"]
+        runner.rkv_effective_kv_lens_before = [640, 704, 768]
+        runner.rkv_effective_kv_lens = {}
+        runner.input_batch = SimpleNamespace(req_ids=["req0", "req1", "req2"], num_reqs=3)
+        runner.requests = {}
+        attn_metadata = {
+            "layer0": SimpleNamespace(rkv_compressed_lens=[0, 608, 700]),
+            "layer1": SimpleNamespace(rkv_compressed_lens=[512, 0, 704]),
+            "layer2": SimpleNamespace(rkv_compressed_lens=[0, 576, 0]),
+        }
+
+        runner._update_rkv_effective_kv_lens(attn_metadata, [1, 1, 1])
+
+        self.assertEqual(
+            runner.rkv_effective_kv_lens,
+            {
+                "req0": 512,
+                "req1": 576,
+                "req2": 700,
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
