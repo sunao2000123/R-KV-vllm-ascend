@@ -114,19 +114,31 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Target compressed KV cache length. R-KV is disabled when this is <= 0.
     "VLLM_ASCEND_RKV_BUDGET": lambda: int(os.getenv("VLLM_ASCEND_RKV_BUDGET", "0")),
     # Compress again only after the effective KV length grows by this buffer.
-    "VLLM_ASCEND_RKV_BUFFER": lambda: int(os.getenv("VLLM_ASCEND_RKV_BUFFER", "128")),
+    "VLLM_ASCEND_RKV_BUFFER": lambda: int(os.getenv("VLLM_ASCEND_RKV_BUFFER", "512")),
     # Recent query/KV observation window used by R-KV scoring.
     "VLLM_ASCEND_RKV_WINDOW_SIZE": lambda: int(os.getenv("VLLM_ASCEND_RKV_WINDOW_SIZE", "8")),
     # Max-pooling kernel size for attention importance smoothing.
     "VLLM_ASCEND_RKV_KERNEL_SIZE": lambda: int(os.getenv("VLLM_ASCEND_RKV_KERNEL_SIZE", "7")),
     # Lambda for mixing attention importance and redundancy scores.
-    "VLLM_ASCEND_RKV_MIX_LAMBDA": lambda: float(os.getenv("VLLM_ASCEND_RKV_MIX_LAMBDA", "0.07")),
+    "VLLM_ASCEND_RKV_MIX_LAMBDA": lambda: float(os.getenv("VLLM_ASCEND_RKV_MIX_LAMBDA", "0.1")),
     # Similar-key representative retention ratio.
-    "VLLM_ASCEND_RKV_RETAIN_RATIO": lambda: float(os.getenv("VLLM_ASCEND_RKV_RETAIN_RATIO", "0.2")),
+    "VLLM_ASCEND_RKV_RETAIN_RATIO": lambda: float(os.getenv("VLLM_ASCEND_RKV_RETAIN_RATIO", "0.1")),
     # Similar-key representative direction: last, first, last_percent, first_percent.
     "VLLM_ASCEND_RKV_RETAIN_DIRECTION": lambda: os.getenv("VLLM_ASCEND_RKV_RETAIN_DIRECTION", "last"),
-    # Emit R-KV enablement and latency checkpoints for service debugging.
-    "VLLM_ASCEND_RKV_TRACE": lambda: bool(int(os.getenv("VLLM_ASCEND_RKV_TRACE", "0"))),
+    # Max source rows sampled for redundancy scoring. Set 0 to use exact all-pairs similarity.
+    "VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE": lambda: int(
+        os.getenv("VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE", "16")
+    ),
+    # Token selection mode: aggregate follows the paper's mean-over-heads score;
+    # per_head preserves the reference implementation's independent head picks.
+    "VLLM_ASCEND_RKV_SELECTION_MODE": lambda: os.getenv("VLLM_ASCEND_RKV_SELECTION_MODE", "aggregate"),
+    # Reuse one R-KV token selection across attention layers in the same
+    # compression step. This keeps the paper-style sequence-level selection
+    # while avoiding full-cache gather/scoring once per layer.
+    "VLLM_ASCEND_RKV_SHARE_SELECTION": lambda: bool(int(os.getenv("VLLM_ASCEND_RKV_SHARE_SELECTION", "1"))),
+    # Debug-only R-KV breakpoint mode: off, log, raise, breakpoint, init,
+    # runtime_enabled, query_cache_update, compress_selected, compress_written.
+    "VLLM_ASCEND_RKV_BREAKPOINT": lambda: os.getenv("VLLM_ASCEND_RKV_BREAKPOINT", "off"),
 }
 
 # end-env-vars-definition
