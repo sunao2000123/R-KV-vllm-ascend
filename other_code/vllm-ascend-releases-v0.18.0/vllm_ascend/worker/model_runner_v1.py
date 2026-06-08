@@ -159,6 +159,37 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
+_RKV_BREAKPOINT_OFF_MODES = ("", "0", "false", "off", "none")
+_RKV_TIMING_MODES = ("timing", "latency", "profile")
+
+
+def _rkv_breakpoint_mode() -> str:
+    return envs_ascend.VLLM_ASCEND_RKV_BREAKPOINT.strip().lower()
+
+
+def _rkv_breakpoint_should_log(mode: str, event: str) -> bool:
+    if mode in _RKV_BREAKPOINT_OFF_MODES:
+        return False
+    if mode in _RKV_TIMING_MODES:
+        return event.startswith("timing_")
+    return True
+
+
+def _rkv_format_breakpoint_fields(fields: dict[str, object]) -> str:
+    return " ".join(f"{key}={value}" for key, value in fields.items())
+
+
+def _rkv_breakpoint(event: str, **fields: object) -> None:
+    mode = _rkv_breakpoint_mode()
+    if not _rkv_breakpoint_should_log(mode, event):
+        return
+
+    formatted = _rkv_format_breakpoint_fields(fields)
+    if formatted:
+        logger.warning("RKV_BREAKPOINT %s %s", event, formatted)
+    else:
+        logger.warning("RKV_BREAKPOINT %s", event)
+
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
@@ -480,6 +511,13 @@ class NPUModelRunner(GPUModelRunner):
             if effective_len is None or effective_len > original_len or original_len == 0:
                 effective_len = original_len
             effective_lens[req_idx] = effective_len
+            _rkv_breakpoint(
+                "timing_state_effective_before",
+                elapsed_ms="0.000",
+                req_id=req_id,
+                original_len=original_len,
+                effective_len=int(effective_len),
+            )
         return effective_lens
 
     def _reset_rkv_state_from_scheduler_output(self, scheduler_output: "SchedulerOutput") -> None:
@@ -531,10 +569,23 @@ class NPUModelRunner(GPUModelRunner):
 
         compressed_lens = self._get_rkv_compressed_lens(attn_metadata)
         for req_idx, req_id in enumerate(self.rkv_current_req_ids):
-            next_len = int(self.rkv_effective_kv_lens_before[req_idx] + num_scheduled_tokens[req_idx])
+            previous_len = int(self.rkv_effective_kv_lens_before[req_idx])
+            scheduled_tokens = int(num_scheduled_tokens[req_idx])
+            compressed_len = 0
+            next_len = int(previous_len + scheduled_tokens)
             if compressed_lens is not None and req_idx < len(compressed_lens) and compressed_lens[req_idx] > 0:
-                next_len = int(compressed_lens[req_idx])
+                compressed_len = int(compressed_lens[req_idx])
+                next_len = compressed_len
             self.rkv_effective_kv_lens[req_id] = next_len
+            _rkv_breakpoint(
+                "timing_state_effective_update",
+                elapsed_ms="0.000",
+                req_id=req_id,
+                previous_len=previous_len,
+                scheduled_tokens=scheduled_tokens,
+                compressed_len=compressed_len,
+                next_len=next_len,
+            )
 
         active_req_ids = set(self.input_batch.req_ids[: self.input_batch.num_reqs])
         for req_id in list(self.rkv_effective_kv_lens):

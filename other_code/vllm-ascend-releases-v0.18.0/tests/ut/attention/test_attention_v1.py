@@ -306,7 +306,7 @@ class TestAscendAttentionBackendImpl(TestBase):
         self._enable_rkv_for_test()
         mock_extra_ctx.capturing = False
         mock_extra_ctx.is_draft_model = False
-        self.impl.rkv_query_cache["req"] = torch.randn(1, 8, 64)
+        self.impl.rkv_query_cache["req"] = torch.randn(8, 8, 64)
         metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly,
                                       seq_len=4096)
         key_states = torch.randn(1, 8, 16, 64)
@@ -324,6 +324,24 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.impl.rkv_compressor.select_indices.assert_called_once()
         mock_write.assert_called_once()
         self.assertEqual(compressed_lens, [1024])
+
+    @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
+    @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
+    def test_rkv_compression_waits_for_query_window(self, mock_extra_ctx,
+                                                    mock_enable_cp):
+        self._enable_rkv_for_test()
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
+        self.impl.rkv_query_cache["req"] = torch.randn(1, 8, 64)
+        metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly,
+                                      seq_len=4096)
+
+        compressed_lens = self.impl._maybe_compress_rkv(
+            torch.randn(1, 8, 64), metadata)
+
+        self.impl.rkv_compressor.select_indices.assert_not_called()
+        self.assertIsNone(compressed_lens)
+        self.assertIsNone(metadata.rkv_compressed_lens)
 
     @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
     @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
@@ -368,9 +386,9 @@ class TestAscendAttentionBackendImpl(TestBase):
                           return_value=key_states) as mock_gather, \
                 patch.object(self.impl, '_write_rkv_selection',
                              return_value=1024) as mock_write:
-            self.impl.rkv_query_cache["req"] = torch.randn(1, 8, 64)
+            self.impl.rkv_query_cache["req"] = torch.randn(8, 8, 64)
             self.impl._maybe_compress_rkv(torch.randn(1, 8, 64), metadata)
-            self.impl.rkv_query_cache["req"] = torch.randn(1, 8, 64)
+            self.impl.rkv_query_cache["req"] = torch.randn(8, 8, 64)
             self.impl._maybe_compress_rkv(torch.randn(1, 8, 64), metadata)
 
         mock_gather.assert_called_once()

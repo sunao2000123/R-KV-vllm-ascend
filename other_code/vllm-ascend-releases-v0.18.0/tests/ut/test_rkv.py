@@ -103,6 +103,26 @@ class TestRKVCompressor(unittest.TestCase):
         self.assertEqual(observation, 2)
         self.assertEqual(indices.shape, (1, 2, 4))
 
+    def test_select_indices_attention_only_skips_similarity(self):
+        torch.manual_seed(0)
+        compressor = RKVCompressor(
+            budget=6,
+            window_size=2,
+            kernel_size=3,
+            selection_mode="attention_only",
+        )
+        key_states = torch.randn(1, 2, 12, 4)
+        query_states = torch.randn(1, 4, 2, 4)
+
+        with patch.object(compressor, "_calculate_similarity") as mock_similarity:
+            selection = compressor.select_indices(key_states, query_states)
+
+        mock_similarity.assert_not_called()
+        self.assertIsNotNone(selection)
+        indices, observation = selection
+        self.assertEqual(observation, 2)
+        self.assertEqual(indices.shape, (1, 4))
+
     def test_update_kv_uses_sampled_similarity_for_large_cache(self):
         torch.manual_seed(0)
         compressor = RKVCompressor(

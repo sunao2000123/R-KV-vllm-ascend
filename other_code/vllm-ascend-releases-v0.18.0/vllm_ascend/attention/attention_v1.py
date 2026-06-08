@@ -1358,6 +1358,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
             cached_query = self.rkv_query_cache.get(req_id)
             if cached_query is None or cached_query.shape[0] == 0:
                 continue
+            required_observation = min(self.rkv_compressor.window_size, seq_len - 1)
+            if cached_query.shape[0] < required_observation:
+                _rkv_breakpoint(
+                    "timing_compress_wait_query_window",
+                    elapsed_ms="0.000",
+                    req_id=req_id,
+                    seq_len=seq_len,
+                    cached_tokens=cached_query.shape[0],
+                    required_tokens=required_observation,
+                )
+                continue
 
             with _rkv_timing("compress_request", query, req_id=req_id, seq_len=seq_len):
                 selection = self._select_rkv_indices(

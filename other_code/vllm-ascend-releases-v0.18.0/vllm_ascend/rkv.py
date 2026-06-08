@@ -237,7 +237,7 @@ class RKVCompressor:
     ) -> None:
         if budget <= window_size:
             raise ValueError("R-KV budget must be greater than window_size")
-        if selection_mode not in ("aggregate", "per_head"):
+        if selection_mode not in ("aggregate", "per_head", "attention_only"):
             raise ValueError(f"Unsupported R-KV selection mode: {selection_mode}")
         self.budget = budget
         self.window_size = window_size
@@ -307,8 +307,11 @@ class RKVCompressor:
                 stride=1,
             )
 
-        with _rkv_timing("similarity", key_states, kv_cache_len=kv_cache_len, observation=observation):
-            similarity_cos = self._calculate_similarity(key_states)[:, :-observation]
+        if self.selection_mode == "attention_only":
+            similarity_cos = None
+        else:
+            with _rkv_timing("similarity", key_states, kv_cache_len=kv_cache_len, observation=observation):
+                similarity_cos = self._calculate_similarity(key_states)[:, :-observation]
 
         keep_old = self.budget - observation
         with _rkv_timing(
@@ -318,13 +321,17 @@ class RKVCompressor:
             mix_lambda=self.mix_lambda,
             selection_mode=self.selection_mode,
         ):
-            final_score = attn_cache * self.mix_lambda - similarity_cos * (1 - self.mix_lambda)
-            if self.selection_mode == "aggregate":
+            if similarity_cos is None:
+                final_score = attn_cache
+                indices = final_score.mean(dim=1).topk(keep_old, dim=-1).indices
+            elif self.selection_mode == "aggregate":
                 # Algorithm 1 in the paper aggregates head scores before top-k
                 # selection, yielding one token set shared by all KV heads. This is
                 # also a better fit for vLLM's block-table cache layout.
+                final_score = attn_cache * self.mix_lambda - similarity_cos * (1 - self.mix_lambda)
                 indices = final_score.mean(dim=1).topk(keep_old, dim=-1).indices
             else:
+                final_score = attn_cache * self.mix_lambda - similarity_cos * (1 - self.mix_lambda)
                 indices = final_score.topk(keep_old, dim=-1).indices
 
         return indices, observation

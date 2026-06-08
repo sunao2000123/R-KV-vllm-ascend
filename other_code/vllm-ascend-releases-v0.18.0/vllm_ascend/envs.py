@@ -130,7 +130,8 @@ env_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ASCEND_RKV_SIMILARITY_SAMPLE_SIZE", "16")
     ),
     # Token selection mode: aggregate follows the paper's mean-over-heads score;
-    # per_head preserves the reference implementation's independent head picks.
+    # per_head preserves the reference implementation's independent head picks;
+    # attention_only skips redundancy similarity for faster service diagnostics.
     "VLLM_ASCEND_RKV_SELECTION_MODE": lambda: os.getenv("VLLM_ASCEND_RKV_SELECTION_MODE", "aggregate"),
     # Reuse one R-KV token selection across attention layers in the same
     # compression step. This keeps the paper-style sequence-level selection
@@ -138,7 +139,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_RKV_SHARE_SELECTION": lambda: bool(int(os.getenv("VLLM_ASCEND_RKV_SHARE_SELECTION", "1"))),
     # Debug-only R-KV breakpoint mode: off, log, timing, raise, breakpoint,
     # init, runtime_enabled, query_cache_update, compress_selected,
-    # compress_written.
+    # compress_written, compress_wait_query_window, state_effective_before,
+    # state_effective_update.
     "VLLM_ASCEND_RKV_BREAKPOINT": lambda: os.getenv("VLLM_ASCEND_RKV_BREAKPOINT", "off"),
 }
 
