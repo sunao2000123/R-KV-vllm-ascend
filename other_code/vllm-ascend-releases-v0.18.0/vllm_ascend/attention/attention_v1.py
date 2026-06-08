@@ -981,6 +981,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
+        block_tables = self._rkv_paged_attention_block_tables(attn_metadata)
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -988,7 +989,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             scale_value=self.scale,
-            block_table=attn_metadata.block_tables,
+            block_table=block_tables,
             context_lens=attn_metadata.seq_lens,
             out=output,
         )
@@ -1092,6 +1093,47 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 seq_lens=list(attn_metadata.seq_lens_list),
             )
         return enabled
+
+    def _rkv_paged_attention_block_tables(
+        self,
+        attn_metadata: AscendMetadata,
+    ) -> torch.Tensor | None:
+        block_tables = attn_metadata.block_tables
+        if not self.rkv_enabled or self.rkv_compressor is None:
+            return block_tables
+        if block_tables is None or block_tables.dim() < 2:
+            return block_tables
+        if self.key_cache is None or self.key_cache.dim() < 2:
+            return block_tables
+        if not getattr(attn_metadata, "rkv_req_ids", None):
+            return block_tables
+
+        seq_lens_list = getattr(attn_metadata, "seq_lens_list", None)
+        if not seq_lens_list:
+            return block_tables
+
+        block_size = int(self.key_cache.shape[1])
+        if block_size <= 0:
+            return block_tables
+
+        max_context_len = max(int(seq_len) for seq_len in seq_lens_list)
+        if max_context_len <= 0:
+            return block_tables
+
+        effective_blocks = max(1, cdiv(max_context_len, block_size))
+        original_blocks = int(block_tables.shape[1])
+        if effective_blocks >= original_blocks:
+            return block_tables
+
+        _rkv_breakpoint(
+            "timing_block_table_trim",
+            elapsed_ms="0.000",
+            original_blocks=original_blocks,
+            effective_blocks=effective_blocks,
+            max_context_len=max_context_len,
+            block_size=block_size,
+        )
+        return block_tables[:, :effective_blocks]
 
     def _rkv_trigger_len(self) -> int:
         assert self.rkv_compressor is not None

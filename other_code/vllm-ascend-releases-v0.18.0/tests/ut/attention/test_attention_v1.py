@@ -411,6 +411,22 @@ class TestAscendAttentionBackendImpl(TestBase):
         self.assertEqual(metadata.seq_lens.item(), 640)
         self.assertEqual(metadata.seq_lens_cpu.item(), 640)
 
+    @patch.dict('os.environ', {'VLLM_ASCEND_RKV_BREAKPOINT': 'log'})
+    @patch('vllm_ascend.attention.attention_v1.logger')
+    def test_rkv_paged_attention_block_tables_use_effective_len(
+            self, mock_logger):
+        self._enable_rkv_for_test()
+        metadata = self._rkv_metadata(AscendAttentionState.DecodeOnly,
+                                      seq_len=319)
+        metadata.block_tables = torch.arange(80).view(1, 80)
+
+        block_tables = self.impl._rkv_paged_attention_block_tables(metadata)
+
+        self.assertEqual(block_tables.shape, (1, 3))
+        self.assertTrue(torch.equal(block_tables, metadata.block_tables[:, :3]))
+        self.assertTrue(any("timing_block_table_trim" in str(call)
+                            for call in mock_logger.warning.call_args_list))
+
     def test_forward_no_attn_metadata(self):
         """Test forward pass when attn_metadata is None"""
         query = torch.randn(10, 8 * 64)
