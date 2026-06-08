@@ -136,8 +136,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # compression step. This keeps the paper-style sequence-level selection
     # while avoiding full-cache gather/scoring once per layer.
     "VLLM_ASCEND_RKV_SHARE_SELECTION": lambda: bool(int(os.getenv("VLLM_ASCEND_RKV_SHARE_SELECTION", "1"))),
-    # Debug-only R-KV breakpoint mode: off, log, raise, breakpoint, init,
-    # runtime_enabled, query_cache_update, compress_selected, compress_written.
+    # Debug-only R-KV breakpoint mode: off, log, timing, raise, breakpoint,
+    # init, runtime_enabled, query_cache_update, compress_selected,
+    # compress_written.
     "VLLM_ASCEND_RKV_BREAKPOINT": lambda: os.getenv("VLLM_ASCEND_RKV_BREAKPOINT", "off"),
 }
 

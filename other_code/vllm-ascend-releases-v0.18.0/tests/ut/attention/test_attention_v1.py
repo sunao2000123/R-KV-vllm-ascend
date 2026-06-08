@@ -244,6 +244,16 @@ class TestAscendAttentionBackendImpl(TestBase):
 
         mock_logger.warning.assert_called_once()
 
+    @patch.dict('os.environ', {'VLLM_ASCEND_RKV_BREAKPOINT': 'timing'})
+    @patch('vllm_ascend.attention.attention_v1.logger')
+    def test_rkv_breakpoint_timing_mode_only_logs_timing(self, mock_logger):
+        _rkv_breakpoint("runtime_enabled", req_count=1)
+        mock_logger.warning.assert_not_called()
+
+        _rkv_breakpoint("timing_compress_request", elapsed_ms="1.000")
+
+        mock_logger.warning.assert_called_once()
+
     @patch('vllm_ascend.attention.attention_v1.enable_cp', return_value=False)
     @patch('vllm_ascend.attention.attention_v1._EXTRA_CTX')
     def test_rkv_query_cache_updates_only_in_decode(self, mock_extra_ctx,

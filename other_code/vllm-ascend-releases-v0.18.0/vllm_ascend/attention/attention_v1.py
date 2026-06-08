@@ -15,8 +15,11 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
+import time
 
 import torch
 import torch_npu
@@ -66,6 +69,20 @@ SWA_INT_MAX = 2147483647
 
 _RKVSelectionCacheKey = tuple[str, int, int, int, int, float, float, str, int, str, str]
 _RKV_SELECTION_CACHE: dict[_RKVSelectionCacheKey, tuple[torch.Tensor, int]] = {}
+_RKV_BREAKPOINT_OFF_MODES = ("", "0", "false", "off", "none")
+_RKV_TIMING_MODES = ("timing", "latency", "profile")
+
+
+def _rkv_breakpoint_mode() -> str:
+    return envs_ascend.VLLM_ASCEND_RKV_BREAKPOINT.strip().lower()
+
+
+def _rkv_breakpoint_should_log(mode: str, event: str) -> bool:
+    if mode in _RKV_BREAKPOINT_OFF_MODES:
+        return False
+    if mode in _RKV_TIMING_MODES:
+        return event.startswith("timing_")
+    return True
 
 
 def _rkv_format_breakpoint_fields(fields: dict[str, object]) -> str:
@@ -73,8 +90,8 @@ def _rkv_format_breakpoint_fields(fields: dict[str, object]) -> str:
 
 
 def _rkv_breakpoint(event: str, **fields: object) -> None:
-    mode = envs_ascend.VLLM_ASCEND_RKV_BREAKPOINT.strip().lower()
-    if mode in ("", "0", "false", "off", "none"):
+    mode = _rkv_breakpoint_mode()
+    if not _rkv_breakpoint_should_log(mode, event):
         return
 
     formatted = _rkv_format_breakpoint_fields(fields)
@@ -87,6 +104,42 @@ def _rkv_breakpoint(event: str, **fields: object) -> None:
         breakpoint()
     if mode in ("raise", event):
         raise RuntimeError(f"RKV_BREAKPOINT {event} {formatted}".strip())
+
+
+def _rkv_timing_enabled() -> bool:
+    mode = _rkv_breakpoint_mode()
+    return mode == "log" or mode in _RKV_TIMING_MODES
+
+
+def _rkv_sync_for_timing(tensor: torch.Tensor | None) -> None:
+    if tensor is None:
+        return
+    device = tensor.device
+    if device.type == "npu":
+        npu = getattr(torch, "npu", None)
+        if npu is not None and hasattr(npu, "synchronize"):
+            npu.synchronize()
+    elif device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+@contextmanager
+def _rkv_timing(event: str, tensor: torch.Tensor | None = None, **fields: object) -> Iterator[None]:
+    if not _rkv_timing_enabled():
+        yield
+        return
+
+    _rkv_sync_for_timing(tensor)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        _rkv_sync_for_timing(tensor)
+        _rkv_breakpoint(
+            f"timing_{event}",
+            elapsed_ms=f"{(time.perf_counter() - start) * 1000:.3f}",
+            **fields,
+        )
 
 
 def _drop_rkv_selection_cache(req_id: str) -> None:
@@ -1048,8 +1101,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
         assert self.rkv_compressor is not None
         return max(1, self._rkv_trigger_len() - self.rkv_compressor.window_size + 1)
 
-    def _update_rkv_query_cache(self, query: torch.Tensor, attn_metadata: AscendMetadata) -> None:
-        if not self._rkv_runtime_enabled(query, attn_metadata):
+    def _update_rkv_query_cache(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        runtime_checked: bool = False,
+    ) -> None:
+        if not runtime_checked and not self._rkv_runtime_enabled(query, attn_metadata):
             return
         assert self.rkv_compressor is not None
         for req_id in attn_metadata.rkv_reset_req_ids or []:
@@ -1257,21 +1315,29 @@ class AscendAttentionBackendImpl(AttentionImpl):
         if self.rkv_share_selection:
             cached_selection = _RKV_SELECTION_CACHE.get(cache_key)
             if cached_selection is not None:
+                _rkv_breakpoint("timing_select_cache_hit", req_id=req_id, seq_len=seq_len, elapsed_ms="0.000")
                 return cached_selection
 
-        key_states = self._gather_rkv_key(req_idx, seq_len, block_tables)
+        with _rkv_timing("gather_key", self.key_cache, req_id=req_id, seq_len=seq_len):
+            key_states = self._gather_rkv_key(req_idx, seq_len, block_tables)
         query_states = cached_query.transpose(0, 1).unsqueeze(0).contiguous()
-        selection = self.rkv_compressor.select_indices(
-            key_states,
-            query_states,
-        )
+        with _rkv_timing("select_indices", key_states, req_id=req_id, seq_len=seq_len):
+            selection = self.rkv_compressor.select_indices(
+                key_states,
+                query_states,
+            )
         if selection is not None and self.rkv_share_selection:
             indices, observation = selection
             _store_rkv_selection_cache(cache_key, (indices.detach(), observation))
         return selection
 
-    def _maybe_compress_rkv(self, query: torch.Tensor, attn_metadata: AscendMetadata) -> None:
-        if not self._rkv_runtime_enabled(query, attn_metadata):
+    def _maybe_compress_rkv(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        runtime_checked: bool = False,
+    ) -> None:
+        if not runtime_checked and not self._rkv_runtime_enabled(query, attn_metadata):
             return
 
         assert self.rkv_compressor is not None
@@ -1293,31 +1359,40 @@ class AscendAttentionBackendImpl(AttentionImpl):
             if cached_query is None or cached_query.shape[0] == 0:
                 continue
 
-            selection = self._select_rkv_indices(
-                req_id,
-                req_idx,
-                seq_len,
-                cached_query,
-                attn_metadata.block_tables,
-            )
-            if selection is None:
-                continue
-            indices, observation = selection
-            _rkv_breakpoint(
-                "compress_selected",
-                req_id=req_id,
-                seq_len=seq_len,
-                budget=self.rkv_compressor.budget,
-                observation=observation,
-                selected_tokens=indices.numel(),
-            )
-            compressed_lens[req_idx] = self._write_rkv_selection(
-                req_idx,
-                seq_len,
-                indices,
-                observation,
-                attn_metadata.block_tables,
-            )
+            with _rkv_timing("compress_request", query, req_id=req_id, seq_len=seq_len):
+                selection = self._select_rkv_indices(
+                    req_id,
+                    req_idx,
+                    seq_len,
+                    cached_query,
+                    attn_metadata.block_tables,
+                )
+                if selection is None:
+                    continue
+                indices, observation = selection
+                _rkv_breakpoint(
+                    "compress_selected",
+                    req_id=req_id,
+                    seq_len=seq_len,
+                    budget=self.rkv_compressor.budget,
+                    observation=observation,
+                    selected_tokens=indices.numel(),
+                )
+                with _rkv_timing(
+                    "write_selection",
+                    self.key_cache,
+                    req_id=req_id,
+                    seq_len=seq_len,
+                    selected_tokens=indices.numel(),
+                    observation=observation,
+                ):
+                    compressed_lens[req_idx] = self._write_rkv_selection(
+                        req_idx,
+                        seq_len,
+                        indices,
+                        observation,
+                        attn_metadata.block_tables,
+                    )
             _rkv_breakpoint(
                 "compress_written",
                 req_id=req_id,
@@ -1380,8 +1455,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_output = self.forward_impl(query, key, value, kv_cache, attn_metadata, output)
         output[:num_tokens] = attn_output[:num_tokens]
         if self.rkv_enabled and attn_metadata.attn_state == AscendAttentionState.DecodeOnly:
-            self._update_rkv_query_cache(query, attn_metadata)
-            self._maybe_compress_rkv(query, attn_metadata)
+            rkv_runtime_enabled = self._rkv_runtime_enabled(query, attn_metadata)
+            if rkv_runtime_enabled:
+                self._update_rkv_query_cache(query, attn_metadata, runtime_checked=True)
+                self._maybe_compress_rkv(query, attn_metadata, runtime_checked=True)
         return output
 
 

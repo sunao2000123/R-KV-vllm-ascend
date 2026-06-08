@@ -4,14 +4,61 @@
 # R-KV cache compression helpers for vLLM-Ascend.
 #
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import math
+import time
 
 import torch
 import torch.nn.functional as F
+from vllm.logger import logger
+
+from vllm_ascend import envs as envs_ascend
 
 
 _SIMILARITY_MAX_CHUNK = 256
 _SIMILARITY_MAX_PAIR_ELEMENTS = 2 * 1024 * 1024
+_RKV_TIMING_MODES = ("log", "timing", "latency", "profile")
+
+
+def _rkv_timing_enabled() -> bool:
+    return envs_ascend.VLLM_ASCEND_RKV_BREAKPOINT.strip().lower() in _RKV_TIMING_MODES
+
+
+def _rkv_format_timing_fields(fields: dict[str, object]) -> str:
+    return " ".join(f"{key}={value}" for key, value in fields.items())
+
+
+def _rkv_sync_for_timing(tensor: torch.Tensor | None) -> None:
+    if tensor is None:
+        return
+    device = tensor.device
+    if device.type == "npu":
+        npu = getattr(torch, "npu", None)
+        if npu is not None and hasattr(npu, "synchronize"):
+            npu.synchronize()
+    elif device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+@contextmanager
+def _rkv_timing(event: str, tensor: torch.Tensor | None = None, **fields: object) -> Iterator[None]:
+    if not _rkv_timing_enabled():
+        yield
+        return
+
+    _rkv_sync_for_timing(tensor)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        _rkv_sync_for_timing(tensor)
+        fields = {
+            "elapsed_ms": f"{(time.perf_counter() - start) * 1000:.3f}",
+            **fields,
+        }
+        formatted = _rkv_format_timing_fields(fields)
+        logger.warning("RKV_BREAKPOINT timing_%s %s", event, formatted)
 
 
 def compute_attention_scores(
@@ -91,28 +138,29 @@ def calculate_similarity(
     key_states = key_states[0]
     num_heads, seq_len = key_states.shape[:2]
 
-    key_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
-    chunk_size = _similarity_chunk_size(seq_len)
-    redundancy_scores = torch.empty((num_heads, seq_len), device=key_states.device, dtype=key_states.dtype)
+    with _rkv_timing("similarity_full", key_states, num_heads=num_heads, seq_len=seq_len):
+        key_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
+        chunk_size = _similarity_chunk_size(seq_len)
+        redundancy_scores = torch.empty((num_heads, seq_len), device=key_states.device, dtype=key_states.dtype)
 
-    for head_idx in range(num_heads):
-        head_key_norm = key_norm[head_idx]
-        score_sum = torch.zeros(seq_len, device=key_states.device, dtype=key_states.dtype)
-        for start in range(0, seq_len, chunk_size):
-            end = min(start + chunk_size, seq_len)
-            similarity_chunk = torch.matmul(head_key_norm[start:end], head_key_norm.transpose(0, 1))
-            diagonal = torch.arange(start, end, device=key_states.device)
-            similarity_chunk[torch.arange(end - start, device=key_states.device), diagonal] = 0.0
+        for head_idx in range(num_heads):
+            head_key_norm = key_norm[head_idx]
+            score_sum = torch.zeros(seq_len, device=key_states.device, dtype=key_states.dtype)
+            for start in range(0, seq_len, chunk_size):
+                end = min(start + chunk_size, seq_len)
+                similarity_chunk = torch.matmul(head_key_norm[start:end], head_key_norm.transpose(0, 1))
+                diagonal = torch.arange(start, end, device=key_states.device)
+                similarity_chunk[torch.arange(end - start, device=key_states.device), diagonal] = 0.0
 
-            similarity_mask = similarity_chunk > threshold
-            retain, valid = _select_retain_indices(similarity_mask, retain_ratio, retain_direction)
-            row_idx = torch.arange(end - start, device=key_states.device)[valid]
-            similarity_chunk[row_idx, retain[valid]] = 0.0
-            score_sum += similarity_chunk.sum(dim=0)
+                similarity_mask = similarity_chunk > threshold
+                retain, valid = _select_retain_indices(similarity_mask, retain_ratio, retain_direction)
+                row_idx = torch.arange(end - start, device=key_states.device)[valid]
+                similarity_chunk[row_idx, retain[valid]] = 0.0
+                score_sum += similarity_chunk.sum(dim=0)
 
-        redundancy_scores[head_idx] = score_sum / seq_len
+            redundancy_scores[head_idx] = score_sum / seq_len
 
-    return redundancy_scores.softmax(dim=-1)
+        return redundancy_scores.softmax(dim=-1)
 
 
 def _sample_similarity_rows(seq_len: int, sample_size: int, device: torch.device) -> torch.Tensor:
@@ -142,23 +190,30 @@ def calculate_sampled_similarity(
     sample_indices = _sample_similarity_rows(seq_len, sample_size, key_states.device)
     sample_count = sample_indices.numel()
 
-    key_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
-    redundancy_scores = torch.empty((num_heads, seq_len), device=key_states.device, dtype=key_states.dtype)
-    sample_row_idx = torch.arange(sample_count, device=key_states.device)
+    with _rkv_timing(
+        "similarity_sampled",
+        key_states,
+        num_heads=num_heads,
+        seq_len=seq_len,
+        sample_count=sample_count,
+    ):
+        key_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
+        redundancy_scores = torch.empty((num_heads, seq_len), device=key_states.device, dtype=key_states.dtype)
+        sample_row_idx = torch.arange(sample_count, device=key_states.device)
 
-    for head_idx in range(num_heads):
-        head_key_norm = key_norm[head_idx]
-        sampled_key_norm = head_key_norm.index_select(0, sample_indices)
-        similarity = torch.matmul(sampled_key_norm, head_key_norm.transpose(0, 1))
-        similarity[sample_row_idx, sample_indices] = 0.0
+        for head_idx in range(num_heads):
+            head_key_norm = key_norm[head_idx]
+            sampled_key_norm = head_key_norm.index_select(0, sample_indices)
+            similarity = torch.matmul(sampled_key_norm, head_key_norm.transpose(0, 1))
+            similarity[sample_row_idx, sample_indices] = 0.0
 
-        similarity_mask = similarity > threshold
-        retain, valid = _select_retain_indices(similarity_mask, retain_ratio, retain_direction)
-        row_idx = sample_row_idx[valid]
-        similarity[row_idx, retain[valid]] = 0.0
-        redundancy_scores[head_idx] = similarity.sum(dim=0) / sample_count
+            similarity_mask = similarity > threshold
+            retain, valid = _select_retain_indices(similarity_mask, retain_ratio, retain_direction)
+            row_idx = sample_row_idx[valid]
+            similarity[row_idx, retain[valid]] = 0.0
+            redundancy_scores[head_idx] = similarity.sum(dim=0) / sample_count
 
-    return redundancy_scores.softmax(dim=-1)
+        return redundancy_scores.softmax(dim=-1)
 
 
 class RKVCompressor:
@@ -228,34 +283,49 @@ class RKVCompressor:
             ).unsqueeze(0)
             return indices, 0
 
-        attn_weights = compute_attention_scores(query_states, key_states)
-        attn_weights_sum = (
-            F.softmax(
-                attn_weights[:, :, -observation:, :-observation],
-                dim=-1,
-                dtype=torch.float32,
+        with _rkv_timing(
+            "attention_scores",
+            query_states,
+            kv_cache_len=kv_cache_len,
+            observation=observation,
+        ):
+            attn_weights = compute_attention_scores(query_states, key_states)
+        with _rkv_timing("attention_pool", query_states, observation=observation, kernel_size=self.kernel_size):
+            attn_weights_sum = (
+                F.softmax(
+                    attn_weights[:, :, -observation:, :-observation],
+                    dim=-1,
+                    dtype=torch.float32,
+                )
+                .mean(dim=-2)
+                .to(query_states.dtype)
             )
-            .mean(dim=-2)
-            .to(query_states.dtype)
-        )
-        attn_cache = F.max_pool1d(
-            attn_weights_sum,
-            kernel_size=self.kernel_size,
-            padding=self.kernel_size // 2,
-            stride=1,
-        )
+            attn_cache = F.max_pool1d(
+                attn_weights_sum,
+                kernel_size=self.kernel_size,
+                padding=self.kernel_size // 2,
+                stride=1,
+            )
 
-        similarity_cos = self._calculate_similarity(key_states)[:, :-observation]
-        final_score = attn_cache * self.mix_lambda - similarity_cos * (1 - self.mix_lambda)
+        with _rkv_timing("similarity", key_states, kv_cache_len=kv_cache_len, observation=observation):
+            similarity_cos = self._calculate_similarity(key_states)[:, :-observation]
 
         keep_old = self.budget - observation
-        if self.selection_mode == "aggregate":
-            # Algorithm 1 in the paper aggregates head scores before top-k
-            # selection, yielding one token set shared by all KV heads. This is
-            # also a better fit for vLLM's block-table cache layout.
-            indices = final_score.mean(dim=1).topk(keep_old, dim=-1).indices
-        else:
-            indices = final_score.topk(keep_old, dim=-1).indices
+        with _rkv_timing(
+            "score_topk",
+            key_states,
+            keep_old=keep_old,
+            mix_lambda=self.mix_lambda,
+            selection_mode=self.selection_mode,
+        ):
+            final_score = attn_cache * self.mix_lambda - similarity_cos * (1 - self.mix_lambda)
+            if self.selection_mode == "aggregate":
+                # Algorithm 1 in the paper aggregates head scores before top-k
+                # selection, yielding one token set shared by all KV heads. This is
+                # also a better fit for vLLM's block-table cache layout.
+                indices = final_score.mean(dim=1).topk(keep_old, dim=-1).indices
+            else:
+                indices = final_score.topk(keep_old, dim=-1).indices
 
         return indices, observation
 
