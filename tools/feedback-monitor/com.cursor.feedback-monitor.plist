@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cursor.feedback-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>/Users/sunao2000/Projects/R-KV-vllm-ascend/tools/feedback-monitor/monitor_daemon.py</string>
+        <string>--repo</string>
+        <string>sunao2000123/R-KV-vllm-ascend</string>
+        <string>--issue</string>
+        <string>1</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/sunao2000/Projects/R-KV-vllm-ascend</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/sunao2000/Projects/R-KV-vllm-ascend/.tmp/feedback-monitor/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/sunao2000/Projects/R-KV-vllm-ascend/.tmp/feedback-monitor/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>FEEDBACK_MONITOR_POLL</key>
+        <string>30</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
